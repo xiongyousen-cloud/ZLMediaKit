@@ -122,10 +122,16 @@ API_EXPORT void API_CALL mk_proxy_player_release(mk_proxy_player ctx);
  * 设置代理播放器配置选项
  * @param ctx 代理播放器指针
  * @param key 配置项键,支持 net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed
+ *            以及进程内转码参数 in_process_transcode/transcode.codec/transcode.encoder/transcode.width/transcode.height
+ *            /transcode.fps/transcode.bitrate/transcode.gop/transcode.threads/transcode.decode_threads/transcode.preset
+ *            /transcode.profile/transcode.pixel_format/transcode.zerolatency/transcode.max_b_frames
  * @param val 配置项值,如果是整形，需要转换成统一转换成string
  * Set proxy player configuration options
  * @param ctx Proxy player pointer
  * @param key Configuration item key, supports net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed
+ *            and in-process transcode options: in_process_transcode/transcode.codec/transcode.encoder/transcode.width/transcode.height
+ *            /transcode.fps/transcode.bitrate/transcode.gop/transcode.threads/transcode.decode_threads/transcode.preset
+ *            /transcode.profile/transcode.pixel_format/transcode.zerolatency/transcode.max_b_frames
  * @param val Configuration item value, if it is an integer, it needs to be converted to a unified string
  
  * [AUTO-TRANSLATED:78938fba]

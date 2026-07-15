@@ -12,10 +12,13 @@
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
+#include <atomic>
 #include "Util/File.h"
 #include "Util/uv_errno.h"
 #include "Transcode.h"
 #include "Common/config.h"
+#include "Extension/Factory.h"
+#include "ext-codec/H264.h"
 
 #define MAX_DELAY_SECOND 3
 
@@ -490,13 +493,13 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num, const std:
 
 FFmpegDecoder::~FFmpegDecoder() {
     stopThread(true);
-    if (_do_merger) {
-        _merger.flush();
-    }
     flush();
 }
 
 void FFmpegDecoder::flush() {
+    if (_do_merger) {
+        _merger.flush();
+    }
     while (true) {
         auto out_frame = _frame_pool.obtain2();
         auto ret = avcodec_receive_frame(_context.get(), out_frame->get());
@@ -761,6 +764,569 @@ FFmpegFrame::Ptr FFmpegSws::inputFrame(const FFmpegFrame::Ptr &frame, int &ret, 
     return nullptr;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static AVCodecID getEncoderCodecId(CodecId codec) {
+    switch (codec) {
+        case CodecH264: return AV_CODEC_ID_H264;
+        case CodecH265: return AV_CODEC_ID_HEVC;
+        case CodecJPEG: return AV_CODEC_ID_MJPEG;
+        case CodecVP8: return AV_CODEC_ID_VP8;
+        case CodecVP9: return AV_CODEC_ID_VP9;
+        default: return AV_CODEC_ID_NONE;
+    }
+}
+
+static CodecId getFrameCodecId(AVCodecID codec) {
+    switch (codec) {
+        case AV_CODEC_ID_H264: return CodecH264;
+        case AV_CODEC_ID_HEVC: return CodecH265;
+        case AV_CODEC_ID_MJPEG: return CodecJPEG;
+        case AV_CODEC_ID_VP8: return CodecVP8;
+        case AV_CODEC_ID_VP9: return CodecVP9;
+        default: return CodecInvalid;
+    }
+}
+
+static std::shared_ptr<AVFrame> cloneAvFrame(const FFmpegFrame::Ptr &frame) {
+    auto cloned = av_frame_clone(frame->get());
+    if (!cloned) {
+        throw std::runtime_error("av_frame_clone failed");
+    }
+    return std::shared_ptr<AVFrame>(cloned, [](AVFrame *ptr) {
+        av_frame_free(&ptr);
+    });
+}
+
+FFmpegEncoder::FFmpegEncoder() {
+    setupFFmpeg();
+}
+
+FFmpegEncoder::~FFmpegEncoder() {
+    stopThread(false);
+    flush();
+}
+
+void FFmpegEncoder::open(const VideoEncodeConfig &config) {
+    if (config.width <= 0 || config.height <= 0) {
+        throw std::invalid_argument("encoder width and height must be positive");
+    }
+    if (config.fps <= 0) {
+        throw std::invalid_argument("encoder fps must be positive");
+    }
+
+    auto codec_id = getEncoderCodecId(config.codec);
+    const AVCodec *codec = nullptr;
+    if (!config.encoder.empty()) {
+        codec = getCodec_l<false>(config.encoder.data());
+    }
+    if (!codec && codec_id != AV_CODEC_ID_NONE) {
+        codec = getCodec_l<false>(codec_id);
+    }
+    if (!codec) {
+        throw std::runtime_error("未找到编码器");
+    }
+
+    _context.reset(avcodec_alloc_context3(codec), [](AVCodecContext *ctx) {
+        avcodec_free_context(&ctx);
+    });
+    if (!_context) {
+        throw std::runtime_error("创建编码器失败");
+    }
+
+    _config = config;
+    _context->width = config.width;
+    _context->height = config.height;
+    _context->time_base = { 1, 1000 };
+    _context->framerate = { config.fps, 1 };
+    _context->bit_rate = config.bitrate;
+    _context->gop_size = config.gop;
+    _context->max_b_frames = config.max_b_frames;
+    _context->pix_fmt = config.pixel_format;
+    _context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    AVDictionary *dict = nullptr;
+    if (config.thread_num <= 0) {
+        av_dict_set(&dict, "threads", "auto", 0);
+    } else {
+        av_dict_set(&dict, "threads", to_string(MIN((unsigned int)config.thread_num, thread::hardware_concurrency())).data(), 0);
+    }
+    if (!config.preset.empty()) {
+        av_dict_set(&dict, "preset", config.preset.data(), 0);
+    }
+    if (!config.profile.empty()) {
+        av_dict_set(&dict, "profile", config.profile.data(), 0);
+    }
+    if (config.zerolatency) {
+        av_dict_set(&dict, "tune", "zerolatency", 0);
+        av_dict_set(&dict, "zerolatency", "1", 0);
+    }
+    av_dict_set(&dict, "strict", "-2", 0);
+
+    auto ret = avcodec_open2(_context.get(), codec, &dict);
+    av_dict_free(&dict);
+    if (ret < 0) {
+        _context.reset();
+        throw std::runtime_error(StrPrinter << "打开编码器" << codec->name << "失败:" << ffmpeg_err(ret));
+    }
+    InfoL << "打开编码器成功:" << codec->name;
+}
+
+const AVCodecContext *FFmpegEncoder::getContext() const {
+    return _context.get();
+}
+
+void FFmpegEncoder::setOnEncode(FFmpegEncoder::onEnc cb) {
+    _cb = std::move(cb);
+}
+
+bool FFmpegEncoder::inputFrame(const FFmpegFrame::Ptr &frame, bool async) {
+    if (!_context) {
+        WarnL << "encoder is not opened";
+        return false;
+    }
+    if (async && !TaskManager::isEnabled()) {
+        startThread("encoder thread");
+    }
+    if (!async || !TaskManager::isEnabled()) {
+        return inputFrame_l(frame);
+    }
+
+    auto frame_cache = std::make_shared<FFmpegFrame>(cloneAvFrame(frame));
+    return addEncodeTask([this, frame_cache]() {
+        inputFrame_l(frame_cache);
+    });
+}
+
+bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
+    auto input = convertFrame(frame);
+    if (!input) {
+        return false;
+    }
+    auto av_frame = input->get();
+    if (av_frame->pts == AV_NOPTS_VALUE) {
+        av_frame->pts = av_frame->pkt_dts;
+    }
+
+    auto ret = avcodec_send_frame(_context.get(), av_frame);
+    if (ret < 0) {
+        WarnL << "avcodec_send_frame failed:" << ffmpeg_err(ret);
+        return false;
+    }
+    receivePackets();
+    return true;
+}
+
+FFmpegFrame::Ptr FFmpegEncoder::convertFrame(const FFmpegFrame::Ptr &frame) {
+    auto av_frame = frame->get();
+    if (av_frame->format == _context->pix_fmt && av_frame->width == _context->width && av_frame->height == _context->height) {
+        return frame;
+    }
+    if (!_sws) {
+        _sws = std::make_shared<FFmpegSws>(_context->pix_fmt, _context->width, _context->height);
+    }
+    return _sws->inputFrame(frame);
+}
+
+void FFmpegEncoder::flush() {
+    if (!_context) {
+        return;
+    }
+    auto ret = avcodec_send_frame(_context.get(), nullptr);
+    if (ret < 0 && ret != AVERROR_EOF) {
+        WarnL << "avcodec_send_frame flush failed:" << ffmpeg_err(ret);
+        return;
+    }
+    receivePackets();
+}
+
+void FFmpegEncoder::receivePackets() {
+    while (true) {
+        auto packet = alloc_av_packet();
+        auto ret = avcodec_receive_packet(_context.get(), packet.get());
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        }
+        if (ret < 0) {
+            WarnL << "avcodec_receive_packet failed:" << ffmpeg_err(ret);
+            break;
+        }
+        onEncode(packet.get());
+    }
+}
+
+void FFmpegEncoder::onEncode(const AVPacket *packet) {
+    if (!_cb || !packet || !packet->data || packet->size <= 0) {
+        return;
+    }
+
+    auto codec = getFrameCodecId(_context->codec_id);
+    if (codec == CodecInvalid) {
+        WarnL << "unsupported encoded codec:" << avcodec_get_name(_context->codec_id);
+        return;
+    }
+
+    auto dts = packet->dts == AV_NOPTS_VALUE ? 0 : av_rescale_q(packet->dts, _context->time_base, { 1, 1000 });
+    auto pts = packet->pts == AV_NOPTS_VALUE ? dts : av_rescale_q(packet->pts, _context->time_base, { 1, 1000 });
+    if (dts < 0) {
+        dts = 0;
+    }
+    if (pts < 0) {
+        pts = dts;
+    }
+
+    std::string payload(reinterpret_cast<const char *>(packet->data), packet->size);
+    auto packet_buffer = std::make_shared<BufferLikeString>(std::move(payload));
+    auto emit_frame = [this, codec, dts, pts](Buffer::Ptr buffer) {
+        auto frame = Factory::getFrameFromBuffer(codec, std::move(buffer), (uint64_t)dts, (uint64_t)pts);
+        if (frame) {
+            _cb(frame);
+        }
+    };
+
+    if (codec == CodecH264 || codec == CodecH265) {
+        auto prefix = prefixSize(packet_buffer->data(), packet_buffer->size());
+        if (prefix) {
+            Buffer::Ptr owner = packet_buffer;
+            splitH264(packet_buffer->data(), packet_buffer->size(), prefix,
+                      [&](const char *ptr, size_t len, size_t nal_prefix) {
+                if (len <= nal_prefix) {
+                    return;
+                }
+                auto offset = (size_t)(ptr - owner->data());
+                emit_frame(std::make_shared<BufferOffset<Buffer::Ptr>>(owner, offset, len));
+            });
+            return;
+        }
+    }
+
+    emit_frame(std::move(packet_buffer));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+FFmpegVideoTranscoder::FFmpegVideoTranscoder(const Track::Ptr &input_track, VideoEncodeConfig output_config, int decoder_thread_num, std::vector<std::string> decoder_codec) {
+    if (!input_track) {
+        throw std::invalid_argument("input track can not be null");
+    }
+    if (input_track->getTrackType() != TrackVideo) {
+        throw std::invalid_argument("only video track can be transcoded");
+    }
+
+    _input_track = input_track;
+    _output_config = std::move(output_config);
+    auto input_video = std::static_pointer_cast<VideoTrack>(input_track);
+    if (_output_config.width <= 0) {
+        _output_config.width = input_video->getVideoWidth();
+    }
+    if (_output_config.height <= 0) {
+        _output_config.height = input_video->getVideoHeight();
+    }
+    if (_output_config.fps <= 0) {
+        _output_config.fps = (int)input_video->getVideoFps();
+        if (_output_config.fps <= 0) {
+            _output_config.fps = 25;
+        }
+    }
+    if (_output_config.gop <= 0) {
+        _output_config.gop = _output_config.fps * 2;
+    }
+
+    _decoder = std::make_shared<FFmpegDecoder>(input_track, decoder_thread_num, std::move(decoder_codec));
+    _decoder->setOnDecode([this](const FFmpegFrame::Ptr &frame) {
+        onDecode(frame);
+    });
+    _encoder = std::make_shared<FFmpegEncoder>();
+    _encoder->setOnEncode([this](const Frame::Ptr &frame) {
+        onEncode(frame);
+    });
+    _output_track = Factory::getTrackByCodecId(_output_config.codec);
+    if (!_output_track) {
+        throw std::runtime_error(StrPrinter << "unsupported output track codec:" << getCodecName(_output_config.codec));
+    }
+    _output_track->setBitRate(_output_config.bitrate);
+}
+
+FFmpegVideoTranscoder::~FFmpegVideoTranscoder() {
+    flush();
+}
+
+bool FFmpegVideoTranscoder::inputFrame(const Frame::Ptr &frame, bool live, bool async) {
+    if (!frame) {
+        return false;
+    }
+    return _decoder->inputFrame(frame, live, async, _enable_merge);
+}
+
+void FFmpegVideoTranscoder::setOnOutput(FFmpegVideoTranscoder::onOutput cb) {
+    _cb = std::move(cb);
+}
+
+void FFmpegVideoTranscoder::flush() {
+    if (_decoder) {
+        _decoder->stopThread(false);
+        _decoder->flush();
+    }
+    if (_encoder) {
+        _encoder->stopThread(false);
+        _encoder->flush();
+    }
+}
+
+Track::Ptr FFmpegVideoTranscoder::getOutputTrack() const {
+    return _output_track;
+}
+
+void FFmpegVideoTranscoder::onDecode(const FFmpegFrame::Ptr &frame) {
+    openEncoderIfNeeded(frame);
+    _encoder->inputFrame(frame, _async_encode);
+}
+
+void FFmpegVideoTranscoder::onEncode(const Frame::Ptr &frame) {
+    if (!frame) {
+        return;
+    }
+    frame->setIndex(_output_track->getIndex());
+    _output_track->inputFrame(frame);
+    if (_cb) {
+        _cb(frame);
+    }
+}
+
+void FFmpegVideoTranscoder::openEncoderIfNeeded(const FFmpegFrame::Ptr &frame) {
+    if (_encoder_opened) {
+        return;
+    }
+
+    auto av_frame = frame ? frame->get() : nullptr;
+    if (_output_config.width <= 0 && av_frame) {
+        _output_config.width = av_frame->width;
+    }
+    if (_output_config.height <= 0 && av_frame) {
+        _output_config.height = av_frame->height;
+    }
+    if (_output_config.width <= 0 || _output_config.height <= 0) {
+        throw std::runtime_error("can not determine output video size");
+    }
+
+    _encoder->open(_output_config);
+    _encoder_opened = true;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+class FFmpegVideoTranscodeSink::OutputState : public std::enable_shared_from_this<OutputState> {
+public:
+    OutputState(MediaSinkInterface::Ptr delegate, EventPoller::Ptr poller)
+        : _delegate(std::move(delegate)), _poller(std::move(poller)) {}
+
+    bool addTrack(const Track::Ptr &track) {
+        bool ret = false;
+        sync([this, track, &ret]() {
+            ret = _delegate->addTrack(track);
+        });
+        return ret;
+    }
+
+    void setOutputTrack(const Track::Ptr &track, int index) {
+        sync([this, track, index]() {
+            _output_track = track;
+            _video_index = index;
+            _waiting_for_output_track = true;
+            if (_output_track) {
+                _output_track->setIndex(index);
+            }
+            addOutputTrackIfReady();
+        });
+    }
+
+    void addTrackCompleted() {
+        sync([this]() {
+            _track_completed = true;
+            forwardCompletionIfReady();
+        });
+    }
+
+    bool inputFrame(const Frame::Ptr &frame) {
+        bool ret = false;
+        sync([this, frame, &ret]() {
+            ret = _delegate->inputFrame(frame);
+        });
+        return ret;
+    }
+
+    void dispatchOutput(const Frame::Ptr &frame) {
+        if (!frame) {
+            return;
+        }
+        auto generation = _generation.load();
+        auto self = shared_from_this();
+        auto task = [self, frame, generation]() {
+            self->inputOutput(frame, generation);
+        };
+        if (_poller && !_poller->isCurrentThread()) {
+            _poller->async(std::move(task), false);
+            return;
+        }
+        task();
+    }
+
+    void resetTracks() {
+        _generation.fetch_add(1);
+        sync([this]() {
+            _track_completed = false;
+            _completion_forwarded = false;
+            _waiting_for_output_track = false;
+            _output_track_added = false;
+            _video_index = -1;
+            _output_track = nullptr;
+            _delegate->resetTracks();
+        });
+    }
+
+    void flush() {
+        if (!_poller) {
+            _delegate->flush();
+            return;
+        }
+
+        auto self = shared_from_this();
+        auto task = [self]() {
+            self->_delegate->flush();
+        };
+        if (_poller->isCurrentThread()) {
+            _poller->async(std::move(task), false);
+            return;
+        }
+        _poller->sync(task);
+    }
+
+private:
+    template <typename Func>
+    void sync(Func func) {
+        if (!_poller || _poller->isCurrentThread()) {
+            func();
+            return;
+        }
+        _poller->sync(func);
+    }
+
+    void inputOutput(const Frame::Ptr &frame, uint64_t generation) {
+        if (generation != _generation.load() || !_output_track) {
+            return;
+        }
+
+        frame->setIndex(_video_index);
+        addOutputTrackIfReady();
+        if (_output_track_added) {
+            _delegate->inputFrame(frame);
+        }
+    }
+
+    void addOutputTrackIfReady() {
+        if (_output_track_added || !_output_track || !_output_track->ready()) {
+            return;
+        }
+        if (!_delegate->addTrack(_output_track)) {
+            WarnL << "failed to add transcoded output track:" << _output_track->getCodecName();
+            return;
+        }
+        _output_track_added = true;
+        forwardCompletionIfReady();
+    }
+
+    void forwardCompletionIfReady() {
+        if (_completion_forwarded || !_track_completed || (_waiting_for_output_track && !_output_track_added)) {
+            return;
+        }
+        _delegate->addTrackCompleted();
+        _completion_forwarded = true;
+    }
+
+private:
+    bool _track_completed = false;
+    bool _completion_forwarded = false;
+    bool _waiting_for_output_track = false;
+    bool _output_track_added = false;
+    int _video_index = -1;
+    std::atomic<uint64_t> _generation{0};
+    MediaSinkInterface::Ptr _delegate;
+    EventPoller::Ptr _poller;
+    Track::Ptr _output_track;
+};
+
+FFmpegVideoTranscodeSink::FFmpegVideoTranscodeSink(MediaSinkInterface::Ptr delegate,
+                                                   VideoEncodeConfig output_config,
+                                                   int decoder_thread_num,
+                                                   std::vector<std::string> decoder_codec,
+                                                   EventPoller::Ptr delegate_poller) {
+    if (!delegate) {
+        throw std::invalid_argument("delegate sink can not be null");
+    }
+    _output_state = std::make_shared<OutputState>(std::move(delegate), std::move(delegate_poller));
+    _output_config = std::move(output_config);
+    _decoder_thread_num = decoder_thread_num;
+    _decoder_codec = std::move(decoder_codec);
+}
+
+FFmpegVideoTranscodeSink::~FFmpegVideoTranscodeSink() {
+    flush();
+}
+
+bool FFmpegVideoTranscodeSink::addTrack(const Track::Ptr &track) {
+    if (!track) {
+        return false;
+    }
+    if (track->getTrackType() != TrackVideo) {
+        return _output_state->addTrack(track);
+    }
+    if (_transcoder) {
+        WarnL << "video transcode sink only supports one video track, ignored:" << track->getCodecName();
+        return false;
+    }
+
+    _video_index = track->getIndex();
+    _transcoder = std::make_shared<FFmpegVideoTranscoder>(track, _output_config, _decoder_thread_num, _decoder_codec);
+    _output_state->setOutputTrack(_transcoder->getOutputTrack(), _video_index);
+    auto output_state = _output_state;
+    _transcoder->setOnOutput([output_state](const Frame::Ptr &frame) {
+        output_state->dispatchOutput(frame);
+    });
+    return true;
+}
+
+void FFmpegVideoTranscodeSink::addTrackCompleted() {
+    _output_state->addTrackCompleted();
+}
+
+void FFmpegVideoTranscodeSink::resetTracks() {
+    if (_transcoder) {
+        _transcoder->flush();
+    }
+    _output_state->resetTracks();
+    _video_index = -1;
+    _transcoder = nullptr;
+}
+
+bool FFmpegVideoTranscodeSink::inputFrame(const Frame::Ptr &frame) {
+    if (!frame) {
+        return false;
+    }
+    if (_transcoder && frame->getTrackType() == TrackVideo && frame->getIndex() == _video_index) {
+        return _transcoder->inputFrame(frame, true, true);
+    }
+    return _output_state->inputFrame(frame);
+}
+
+void FFmpegVideoTranscodeSink::flush() {
+    if (_transcoder) {
+        _transcoder->flush();
+    }
+    if (_output_state) {
+        _output_state->flush();
+    }
+}
+
 std::tuple<bool, std::string> FFmpegUtils::saveFrame(const FFmpegFrame::Ptr &frame, const char *filename, AVPixelFormat fmt, int w, int h, const char *font_path) {
     std::shared_ptr<AVFilterGraph> _filter_graph;
     AVFilterContext *buffersrc_ctx = nullptr;
@@ -859,7 +1425,13 @@ std::tuple<bool, std::string> FFmpegUtils::saveFrame(const FFmpegFrame::Ptr &fra
         return make_tuple<bool, std::string>(false, ss.data());
     }
 
-    if ((ret = avfilter_link(buffersrc_ctx, 0, drawtext_ctx1, 0) < 0 || avfilter_link(drawtext_ctx1, 0, buffersink_ctx, 0))< 0) {
+    ret = avfilter_link(buffersrc_ctx, 0, drawtext_ctx1, 0);
+    if (ret < 0) {
+        ss << "avfilter_link: " << ret << " " << ffmpeg_err(ret);
+        return make_tuple<bool, std::string>(false, ss.data());
+    }
+    ret = avfilter_link(drawtext_ctx1, 0, buffersink_ctx, 0);
+    if (ret < 0) {
         ss << "avfilter_link: " << ret << " " << ffmpeg_err(ret);
         return make_tuple<bool, std::string>(false, ss.data());
     }

@@ -17,11 +17,88 @@
 #include "Util/MD5.h"
 #include "Util/logger.h"
 #include "Util/mini.h"
+#if defined(ENABLE_FFMPEG)
+#include "Codec/Transcode.h"
+#endif
 
 using namespace toolkit;
 using namespace std;
 
 namespace mediakit {
+
+#if defined(ENABLE_FFMPEG)
+static CodecId getTranscodeCodec(const string &codec) {
+    if (codec.empty()) {
+        return CodecH264;
+    }
+    auto codec_id = getCodecId(codec);
+    switch (codec_id) {
+        case CodecH264:
+        case CodecH265:
+        case CodecJPEG:
+        case CodecVP8:
+        case CodecVP9:
+            return codec_id;
+        default:
+            WarnL << "unsupported in-process transcode codec:" << codec << ", fallback to H264";
+            return CodecH264;
+    }
+}
+
+static AVPixelFormat getTranscodePixelFormat(const string &format) {
+    if (format.empty()) {
+        return AV_PIX_FMT_YUV420P;
+    }
+    auto pix_fmt = av_get_pix_fmt(format.data());
+    if (pix_fmt == AV_PIX_FMT_NONE) {
+        WarnL << "unsupported in-process transcode pixel format:" << format << ", fallback to yuv420p";
+        return AV_PIX_FMT_YUV420P;
+    }
+    return pix_fmt;
+}
+
+static VideoEncodeConfig makeTranscodeConfig(toolkit::mINI &ini, const VideoTrack::Ptr &track) {
+    VideoEncodeConfig config;
+    config.codec = getTranscodeCodec(ini["transcode.codec"]);
+    config.encoder = ini["transcode.encoder"];
+    config.width = ini["transcode.width"].as<int>();
+    config.height = ini["transcode.height"].as<int>();
+    config.fps = ini["transcode.fps"].as<int>();
+    config.bitrate = ini["transcode.bitrate"].as<int>();
+    config.gop = ini["transcode.gop"].as<int>();
+    config.max_b_frames = ini["transcode.max_b_frames"].as<int>();
+    config.thread_num = ini["transcode.threads"].as<int>();
+    config.pixel_format = getTranscodePixelFormat(ini["transcode.pixel_format"]);
+    config.preset = ini["transcode.preset"].empty() ? config.preset : (string)ini["transcode.preset"];
+    config.profile = ini["transcode.profile"].empty() ? config.profile : (string)ini["transcode.profile"];
+    config.zerolatency = ini["transcode.zerolatency"].empty() ? config.zerolatency : ini["transcode.zerolatency"].as<bool>();
+
+    if (track) {
+        if (config.width <= 0) {
+            config.width = track->getVideoWidth();
+        }
+        if (config.height <= 0) {
+            config.height = track->getVideoHeight();
+        }
+        if (config.fps <= 0) {
+            config.fps = (int)track->getVideoFps();
+        }
+    }
+    if (config.fps <= 0) {
+        config.fps = 25;
+    }
+    if (config.bitrate <= 0) {
+        config.bitrate = 2 * 1024 * 1024;
+    }
+    if (config.gop <= 0) {
+        config.gop = config.fps * 2;
+    }
+    if (config.thread_num == 0) {
+        config.thread_num = 1;
+    }
+    return config;
+}
+#endif
 
 PlayerProxy::PlayerProxy(
     const MediaTuple &tuple, const ProtocolOption &option, int retry_count,
@@ -176,8 +253,13 @@ void PlayerProxy::play(const string &url) {
         if (strongSelf->_muxer) {
             auto tracks = strongSelf->MediaPlayer::getTracks(false);
             for (auto &track : tracks) {
-                track->delDelegate(strongSelf->_muxer.get());
+                if (track->getTrackType() == TrackVideo && strongSelf->_video_proxy_sink) {
+                    track->delDelegate(strongSelf->_video_proxy_sink.get());
+                } else {
+                    track->delDelegate(strongSelf->_muxer.get());
+                }
             }
+            strongSelf->_video_proxy_sink.reset();
 
             GET_CONFIG(bool, reset_when_replay, General::kResetWhenRePlay);
             if (reset_when_replay) {
@@ -342,15 +424,38 @@ void PlayerProxy::onPlaySuccess() {
         }
     }
     _muxer->setMediaListener(shared_from_this());
+    _video_proxy_sink.reset();
 
     auto videoTrack = getTrack(TrackVideo, false);
     if (videoTrack) {
+        MediaSinkInterface::Ptr video_sink = _muxer;
+#if defined(ENABLE_FFMPEG)
+        if ((*this)["in_process_transcode"].as<bool>()) {
+            auto config = makeTranscodeConfig(*this, std::static_pointer_cast<VideoTrack>(videoTrack));
+            InfoL << "enable in-process transcode:"
+                  << videoTrack->getCodecName() << " -> " << getCodecName(config.codec)
+                  << ", size:" << config.width << "x" << config.height
+                  << ", fps:" << config.fps
+                  << ", bitrate:" << config.bitrate;
+            auto owner_poller = _muxer->getOwnerPoller(MediaSource::NullMediaSource());
+            video_sink = std::make_shared<FFmpegVideoTranscodeSink>(_muxer,
+                                                                    std::move(config),
+                                                                    (*this)["transcode.decode_threads"].as<int>(),
+                                                                    std::vector<std::string>{},
+                                                                    std::move(owner_poller));
+            _video_proxy_sink = video_sink;
+        }
+#else
+        if ((*this)["in_process_transcode"].as<bool>()) {
+            WarnL << "in-process transcode ignored because ENABLE_FFMPEG is off";
+        }
+#endif
         // 添加视频  [AUTO-TRANSLATED:afc7e0f7]
         // Add video
-        _muxer->addTrack(videoTrack);
+        video_sink->addTrack(videoTrack);
         // 视频数据写入_mediaMuxer  [AUTO-TRANSLATED:fc07e1c9]
         // Write video data to _mediaMuxer
-        videoTrack->addDelegate(_muxer);
+        videoTrack->addDelegate(video_sink);
     }
 
     auto audioTrack = getTrack(TrackAudio, false);
@@ -365,7 +470,11 @@ void PlayerProxy::onPlaySuccess() {
 
     // 添加完毕所有track，防止单track情况下最大等待3秒  [AUTO-TRANSLATED:8908bc01]
     // After adding all tracks, prevent the maximum waiting time of 3 seconds in the case of a single track
-    _muxer->addTrackCompleted();
+    if (_video_proxy_sink) {
+        _video_proxy_sink->addTrackCompleted();
+    } else {
+        _muxer->addTrackCompleted();
+    }
 
     if (_media_src) {
         // 让_muxer对象拦截一部分事件(比如说录像相关事件)  [AUTO-TRANSLATED:7d27c400]

@@ -36,9 +36,14 @@ API_EXPORT mk_proxy_player API_CALL mk_proxy_player_create3(const char *vhost, c
 
 API_EXPORT mk_proxy_player API_CALL mk_proxy_player_create4(const char *vhost, const char *app, const char *stream, mk_ini ini, int retry_count) {
     assert(vhost && app && stream);
-    ProtocolOption option(*((mINI *)ini));
+    auto ini_ptr = (mINI *)ini;
+    ProtocolOption option(*ini_ptr);
     MediaTuple tuple = {vhost, app, stream, ""};
-    PlayerProxy::Ptr *obj(new PlayerProxy::Ptr(new PlayerProxy(tuple, option, retry_count)));
+    auto player = std::make_shared<PlayerProxy>(tuple, option, retry_count);
+    for (auto &pr : *ini_ptr) {
+        (*player)[pr.first] = pr.second;
+    }
+    PlayerProxy::Ptr *obj(new PlayerProxy::Ptr(std::move(player)));
     return (mk_proxy_player)obj;
 }
 

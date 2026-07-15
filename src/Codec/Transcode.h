@@ -15,6 +15,7 @@
 
 #include "Util/TimeTicker.h"
 #include "Common/MediaSink.h"
+#include "Poller/EventPoller.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,24 @@ extern "C" {
 #define FF_CODEC_VER_7_1 AV_VERSION_INT(61, 0, 0)
 
 namespace mediakit {
+
+class FFmpegSws;
+
+struct VideoEncodeConfig {
+    CodecId codec = CodecH264;
+    std::string encoder;
+    int width = 0;
+    int height = 0;
+    int fps = 25;
+    int bitrate = 2 * 1024 * 1024;
+    int gop = 50;
+    int max_b_frames = 0;
+    int thread_num = 1;
+    AVPixelFormat pixel_format = AV_PIX_FMT_YUV420P;
+    std::string preset = "veryfast";
+    std::string profile;
+    bool zerolatency = true;
+};
 
 class FFmpegFrame {
 public:
@@ -142,6 +161,92 @@ private:
     std::shared_ptr<AVCodecContext> _context;
     FrameMerger _merger{FrameMerger::h264_prefix};
     toolkit::ResourcePool<FFmpegFrame> _frame_pool;
+};
+
+class FFmpegEncoder : public TaskManager {
+public:
+    using Ptr = std::shared_ptr<FFmpegEncoder>;
+    using onEnc = std::function<void(const Frame::Ptr &)>;
+
+    FFmpegEncoder();
+    ~FFmpegEncoder() override;
+
+    void open(const VideoEncodeConfig &config);
+    bool inputFrame(const FFmpegFrame::Ptr &frame, bool async = false);
+    void setOnEncode(onEnc cb);
+    void flush();
+    const AVCodecContext *getContext() const;
+
+private:
+    bool inputFrame_l(const FFmpegFrame::Ptr &frame);
+    FFmpegFrame::Ptr convertFrame(const FFmpegFrame::Ptr &frame);
+    void receivePackets();
+    void onEncode(const AVPacket *packet);
+
+private:
+    onEnc _cb;
+    VideoEncodeConfig _config;
+    std::shared_ptr<AVCodecContext> _context;
+    std::shared_ptr<FFmpegSws> _sws;
+};
+
+class FFmpegVideoTranscoder {
+public:
+    using Ptr = std::shared_ptr<FFmpegVideoTranscoder>;
+    using onOutput = std::function<void(const Frame::Ptr &)>;
+
+    FFmpegVideoTranscoder(const Track::Ptr &input_track, VideoEncodeConfig output_config, int decoder_thread_num = 2, std::vector<std::string> decoder_codec = {});
+    ~FFmpegVideoTranscoder();
+
+    bool inputFrame(const Frame::Ptr &frame, bool live = true, bool async = true);
+    void setOnOutput(onOutput cb);
+    void flush();
+    Track::Ptr getOutputTrack() const;
+
+private:
+    void onDecode(const FFmpegFrame::Ptr &frame);
+    void onEncode(const Frame::Ptr &frame);
+    void openEncoderIfNeeded(const FFmpegFrame::Ptr &frame);
+
+private:
+    bool _encoder_opened = false;
+    bool _enable_merge = true;
+    bool _async_encode = false;
+    Track::Ptr _input_track;
+    VideoEncodeConfig _output_config;
+    FFmpegDecoder::Ptr _decoder;
+    FFmpegEncoder::Ptr _encoder;
+    Track::Ptr _output_track;
+    onOutput _cb;
+};
+
+class FFmpegVideoTranscodeSink : public MediaSinkInterface {
+public:
+    using Ptr = std::shared_ptr<FFmpegVideoTranscodeSink>;
+
+    FFmpegVideoTranscodeSink(MediaSinkInterface::Ptr delegate,
+                            VideoEncodeConfig output_config,
+                            int decoder_thread_num = 2,
+                            std::vector<std::string> decoder_codec = {},
+                            toolkit::EventPoller::Ptr delegate_poller = nullptr);
+    ~FFmpegVideoTranscodeSink() override;
+
+    bool addTrack(const Track::Ptr &track) override;
+    void addTrackCompleted() override;
+    void resetTracks() override;
+    bool inputFrame(const Frame::Ptr &frame) override;
+    void flush() override;
+
+private:
+    class OutputState;
+
+private:
+    int _video_index = -1;
+    int _decoder_thread_num = 2;
+    VideoEncodeConfig _output_config;
+    std::vector<std::string> _decoder_codec;
+    FFmpegVideoTranscoder::Ptr _transcoder;
+    std::shared_ptr<OutputState> _output_state;
 };
 
 class FFmpegSws {

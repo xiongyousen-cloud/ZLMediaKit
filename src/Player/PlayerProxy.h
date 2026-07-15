@@ -173,6 +173,7 @@ private:
     std::function<void(const toolkit::SockException &ex)> _on_play;
     TranslationInfo _transtalion_info;
     MultiMediaSourceMuxer::Ptr _muxer;
+    MediaSinkInterface::Ptr _video_proxy_sink;
 
     toolkit::Ticker _live_ticker;
     // 0 表示正常 1 表示正在尝试拉流  [AUTO-TRANSLATED:2080bedf]
