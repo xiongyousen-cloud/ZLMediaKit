@@ -50,3 +50,5 @@
 /cmake-build-*
 /3rdpart/ZLToolKit/cmake-build-mq/
 /.cache/
+# codegraph local index (DB / pid / socket / logs — machine-local, never commit)
+/.codegraph/
