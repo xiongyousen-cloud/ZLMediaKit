@@ -66,29 +66,31 @@ int main() {
 
     size_t encoded_bytes = 0;
     vector<Frame::Ptr> encoded_frames;
-    FFmpegEncoder encoder;
-    encoder.setOnEncode([&](const Frame::Ptr &encoded) {
-        if (!encoded) {
-            return;
-        }
-        encoded_bytes += encoded->size();
-        if (encoded->getCodecId() != CodecJPEG) {
-            cerr << "unexpected codec: " << getCodecName(encoded->getCodecId()) << endl;
-            exit(2);
-        }
-        encoded_frames.emplace_back(encoded);
-    });
+    {
+        FFmpegEncoder encoder;
+        encoder.setOnEncode([&](const Frame::Ptr &encoded) {
+            if (!encoded) {
+                return;
+            }
+            encoded_bytes += encoded->size();
+            if (encoded->getCodecId() != CodecJPEG) {
+                cerr << "unexpected codec: " << getCodecName(encoded->getCodecId()) << endl;
+                exit(2);
+            }
+            encoded_frames.emplace_back(encoded);
+        });
 
-    encoder.open(config);
-    for (int i = 0; i < 3; ++i) {
-        frame->get()->pts = i * 1000;
-        frame->get()->pkt_dts = i * 1000;
-        if (!encoder.inputFrame(frame)) {
-            cerr << "input frame failed" << endl;
-            return 1;
+        encoder.open(config);
+        for (int i = 0; i < 3; ++i) {
+            frame->get()->pts = i * 1000;
+            frame->get()->pkt_dts = i * 1000;
+            if (!encoder.inputFrame(frame)) {
+                cerr << "input frame failed" << endl;
+                return 1;
+            }
         }
+        encoder.flush();
     }
-    encoder.flush();
 
     if (!encoded_bytes) {
         cerr << "encoder produced no packet" << endl;
@@ -106,18 +108,20 @@ int main() {
         h264_config.pixel_format = AV_PIX_FMT_YUV420P;
 
         vector<Frame::Ptr> h264_frames;
-        FFmpegEncoder h264_encoder;
-        h264_encoder.setOnEncode([&](const Frame::Ptr &encoded) {
-            h264_frames.emplace_back(encoded);
-        });
-        h264_encoder.open(h264_config);
-        frame->get()->pts = 0;
-        frame->get()->pkt_dts = 0;
-        if (!h264_encoder.inputFrame(frame)) {
-            cerr << "H264 encoder input frame failed" << endl;
-            return 1;
+        {
+            FFmpegEncoder h264_encoder;
+            h264_encoder.setOnEncode([&](const Frame::Ptr &encoded) {
+                h264_frames.emplace_back(encoded);
+            });
+            h264_encoder.open(h264_config);
+            frame->get()->pts = 0;
+            frame->get()->pkt_dts = 0;
+            if (!h264_encoder.inputFrame(frame)) {
+                cerr << "H264 encoder input frame failed" << endl;
+                return 1;
+            }
+            h264_encoder.flush();
         }
-        h264_encoder.flush();
 
         auto h264_track = Factory::getTrackByCodecId(CodecH264);
         bool saw_config = false;
@@ -170,6 +174,35 @@ int main() {
         cerr << "encoder produced no frame" << endl;
         return 1;
     }
+
+    auto rate_input_track = std::make_shared<VideoTrackImp>(CodecJPEG, config.width, config.height, 25);
+    auto rate_output_config = make_config(32, 32);
+    rate_output_config.fps = 10;
+    rate_output_config.gop = 20;
+    size_t rate_limited_frames = 0;
+    {
+        FFmpegVideoTranscoder rate_transcoder(rate_input_track, rate_output_config, 1);
+        rate_transcoder.setOnOutput([&](const Frame::Ptr &encoded) {
+            if (encoded) {
+                ++rate_limited_frames;
+            }
+        });
+        auto jpeg_buffer = std::make_shared<toolkit::BufferLikeString>(
+            string(encoded_frames.front()->data(), encoded_frames.front()->size()));
+        for (int i = 0; i < 25; ++i) {
+            auto input = Factory::getFrameFromBuffer(CodecJPEG, jpeg_buffer, i * 40, i * 40);
+            if (!rate_transcoder.inputFrame(input, false, false)) {
+                cerr << "rate limiter transcoder input frame failed" << endl;
+                return 1;
+            }
+        }
+        rate_transcoder.flush();
+    }
+    if (rate_limited_frames < 9 || rate_limited_frames > 11) {
+        cerr << "expected about 10 rate-limited frames, got " << rate_limited_frames << endl;
+        return 1;
+    }
+    cout << "rate-limited frames: " << rate_limited_frames << endl;
 
     auto input_track = std::make_shared<VideoTrackImp>(CodecJPEG, config.width, config.height, config.fps);
     auto output_config = make_config(32, 32);

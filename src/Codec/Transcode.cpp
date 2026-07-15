@@ -33,9 +33,27 @@ static string ffmpeg_err(int errnum) {
     return errbuf;
 }
 
-std::unique_ptr<AVPacket, void (*)(AVPacket *)> alloc_av_packet() {
-    return std::unique_ptr<AVPacket, void (*)(AVPacket *)>(av_packet_alloc(), [](AVPacket *pkt) { av_packet_free(&pkt); });
+using AVPacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket *)>;
+
+AVPacketPtr alloc_av_packet() {
+    return AVPacketPtr(av_packet_alloc(), [](AVPacket *pkt) { av_packet_free(&pkt); });
 }
+
+class FFmpegPacketBuffer final : public Buffer {
+public:
+    explicit FFmpegPacketBuffer(AVPacketPtr packet) : _packet(std::move(packet)) {}
+
+    char *data() const override {
+        return reinterpret_cast<char *>(_packet->data);
+    }
+
+    size_t size() const override {
+        return static_cast<size_t>(_packet->size);
+    }
+
+private:
+    AVPacketPtr _packet;
+};
 
 //////////////////////////////////////////////////////////////////////////////////////////
 static void on_ffmpeg_log(void *ctx, int level, const char *fmt, va_list args) {
@@ -951,12 +969,15 @@ void FFmpegEncoder::receivePackets() {
             WarnL << "avcodec_receive_packet failed:" << ffmpeg_err(ret);
             break;
         }
-        onEncode(packet.get());
+        auto packet_dts = packet->dts;
+        auto packet_pts = packet->pts;
+        Buffer::Ptr packet_buffer = std::make_shared<FFmpegPacketBuffer>(std::move(packet));
+        onEncode(std::move(packet_buffer), packet_dts, packet_pts);
     }
 }
 
-void FFmpegEncoder::onEncode(const AVPacket *packet) {
-    if (!_cb || !packet || !packet->data || packet->size <= 0) {
+void FFmpegEncoder::onEncode(Buffer::Ptr packet_buffer, int64_t packet_dts, int64_t packet_pts) {
+    if (!_cb || !packet_buffer || !packet_buffer->data() || !packet_buffer->size()) {
         return;
     }
 
@@ -966,8 +987,8 @@ void FFmpegEncoder::onEncode(const AVPacket *packet) {
         return;
     }
 
-    auto dts = packet->dts == AV_NOPTS_VALUE ? 0 : av_rescale_q(packet->dts, _context->time_base, { 1, 1000 });
-    auto pts = packet->pts == AV_NOPTS_VALUE ? dts : av_rescale_q(packet->pts, _context->time_base, { 1, 1000 });
+    auto dts = packet_dts == AV_NOPTS_VALUE ? 0 : av_rescale_q(packet_dts, _context->time_base, { 1, 1000 });
+    auto pts = packet_pts == AV_NOPTS_VALUE ? dts : av_rescale_q(packet_pts, _context->time_base, { 1, 1000 });
     if (dts < 0) {
         dts = 0;
     }
@@ -975,8 +996,6 @@ void FFmpegEncoder::onEncode(const AVPacket *packet) {
         pts = dts;
     }
 
-    std::string payload(reinterpret_cast<const char *>(packet->data), packet->size);
-    auto packet_buffer = std::make_shared<BufferLikeString>(std::move(payload));
     auto emit_frame = [this, codec, dts, pts](Buffer::Ptr buffer) {
         auto frame = Factory::getFrameFromBuffer(codec, std::move(buffer), (uint64_t)dts, (uint64_t)pts);
         if (frame) {
@@ -1078,8 +1097,36 @@ Track::Ptr FFmpegVideoTranscoder::getOutputTrack() const {
 }
 
 void FFmpegVideoTranscoder::onDecode(const FFmpegFrame::Ptr &frame) {
+    if (!shouldEncode(frame)) {
+        return;
+    }
     openEncoderIfNeeded(frame);
     _encoder->inputFrame(frame, _async_encode);
+}
+
+bool FFmpegVideoTranscoder::shouldEncode(const FFmpegFrame::Ptr &frame) {
+    if (!frame || _output_config.fps <= 0) {
+        return true;
+    }
+
+    auto av_frame = frame->get();
+    auto timestamp = av_frame->pts != AV_NOPTS_VALUE ? av_frame->pts : av_frame->pkt_dts;
+    if (timestamp == AV_NOPTS_VALUE) {
+        return true;
+    }
+
+    // In this scale one output-frame interval is exactly 1000 ticks.
+    auto tick = av_rescale(timestamp, _output_config.fps, 1);
+    if (_next_encode_tick == AV_NOPTS_VALUE || _last_input_tick == AV_NOPTS_VALUE || tick < _last_input_tick) {
+        _next_encode_tick = tick;
+    }
+    _last_input_tick = tick;
+    if (tick < _next_encode_tick) {
+        return false;
+    }
+
+    _next_encode_tick += ((tick - _next_encode_tick) / 1000 + 1) * 1000;
+    return true;
 }
 
 void FFmpegVideoTranscoder::onEncode(const Frame::Ptr &frame) {

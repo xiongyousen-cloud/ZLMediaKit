@@ -181,7 +181,7 @@ private:
     bool inputFrame_l(const FFmpegFrame::Ptr &frame);
     FFmpegFrame::Ptr convertFrame(const FFmpegFrame::Ptr &frame);
     void receivePackets();
-    void onEncode(const AVPacket *packet);
+    void onEncode(toolkit::Buffer::Ptr packet_buffer, int64_t packet_dts, int64_t packet_pts);
 
 private:
     onEnc _cb;
@@ -207,11 +207,14 @@ private:
     void onDecode(const FFmpegFrame::Ptr &frame);
     void onEncode(const Frame::Ptr &frame);
     void openEncoderIfNeeded(const FFmpegFrame::Ptr &frame);
+    bool shouldEncode(const FFmpegFrame::Ptr &frame);
 
 private:
     bool _encoder_opened = false;
     bool _enable_merge = true;
     bool _async_encode = false;
+    int64_t _next_encode_tick = AV_NOPTS_VALUE;
+    int64_t _last_input_tick = AV_NOPTS_VALUE;
     Track::Ptr _input_track;
     VideoEncodeConfig _output_config;
     FFmpegDecoder::Ptr _decoder;
