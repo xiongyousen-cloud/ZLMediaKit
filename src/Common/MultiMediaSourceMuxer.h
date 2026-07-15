@@ -133,7 +133,7 @@ public:
      
      * [AUTO-TRANSLATED:cb1fd8a9]
      */
-    bool setupRecord(Recorder::type type, bool start, const std::string &custom_path, size_t max_second);
+    bool setupRecord(MediaSource &sender, Recorder::type type, bool start, const std::string &custom_path, size_t max_second);
 
     /**
      * 开始录制mp4
@@ -194,6 +194,9 @@ public:
      */
     std::shared_ptr<MultiMediaSourceMuxer> getMuxer(MediaSource &sender) const override;
 
+    // 获取frame ring reader
+    RingType::RingReader::Ptr getFrameReader();
+
     const ProtocolOption &getOption() const;
     const MediaTuple &getMediaTuple() const;
     std::string shortUrl() const;
@@ -238,7 +241,7 @@ protected:
     bool onTrackFrame_l(const Frame::Ptr &frame);
 
 private:
-    void createGopCacheIfNeed(size_t gop_count);
+    void createGopCacheIfNeed();
     std::shared_ptr<MediaSinkInterface> makeRecorder(Recorder::type type);
 
 private:
@@ -266,7 +269,6 @@ private:
     toolkit::EventPoller::Ptr _poller;
     RingType::Ptr _ring;
     MediaSinkInterface::Ptr _delegate;
-    MediaSourceNull::Ptr _null_src;
     // 对象个数统计  [AUTO-TRANSLATED:3b43e8c2]
     // Object count statistics
     toolkit::ObjectStatistic<MultiMediaSourceMuxer> _statistic;
