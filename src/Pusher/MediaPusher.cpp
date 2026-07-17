@@ -31,20 +31,13 @@ MediaPusher::MediaPusher(const string &schema,
         MediaPusher(MediaSource::find(schema, vhost, app, stream), poller){
 }
 
-static void setOnCreateSocket_l(const std::shared_ptr<PusherBase> &delegate, const Socket::onCreateSocket &cb){
-    auto helper = dynamic_pointer_cast<SocketHelper>(delegate);
-    if (helper) {
-        helper->setOnCreateSocket(cb);
-    }
-}
-
 void MediaPusher::publish(const string &url) {
     _delegate = PusherBase::createPusher(_poller, _src.lock(), url);
     assert(_delegate);
-    setOnCreateSocket_l(_delegate, _on_create_socket);
     _delegate->setOnShutdown(_on_shutdown);
     _delegate->setOnPublished(_on_publish);
     _delegate->mINI::operator=(*this);
+    _delegate->setSocketCreator(_on_create_socket);
     _delegate->publish(url);
     _url = url;
 }
@@ -54,8 +47,7 @@ EventPoller::Ptr MediaPusher::getPoller(){
 }
 
 void MediaPusher::setOnCreateSocket(Socket::onCreateSocket cb){
-    setOnCreateSocket_l(_delegate, cb);
-    _on_create_socket = std::move(cb);
+    setSocketCreator(std::move(cb));
 }
 
 } /* namespace mediakit */

@@ -44,6 +44,7 @@ void WebRtcProxyPusher::publish(const string &strUrl) {
 
 void WebRtcProxyPusher::teardown() {
     DebugL;
+    doBye();
     _transport = nullptr;
 }
 

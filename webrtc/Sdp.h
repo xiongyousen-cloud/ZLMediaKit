@@ -298,6 +298,7 @@ class SdpAttrIceOption : public SdpItem {
 public:
     // a=ice-options:trickle
     bool trickle { false };
+    bool ice2 { false };
     bool renomination { false };
     void parse(const std::string &str) override;
     std::string toString() const override;
@@ -649,6 +650,7 @@ public:
 
     ////////  rtcp  ////////
     bool rtcp_mux { false };
+    bool rtcp_mux_only { false };
     bool rtcp_rsize { false };
     SdpAttrRtcp rtcp_addr;
 
@@ -657,6 +659,7 @@ public:
 
     //////// ice ////////
     bool ice_trickle { false };
+    bool ice2 { false };
     bool ice_lite { false };
     bool ice_renomination { false };
     std::string ice_ufrag;
@@ -716,6 +719,7 @@ public:
     class RtcTrackConfigure {
     public:
         bool rtcp_mux;
+        bool rtcp_mux_only;
         bool rtcp_rsize;
         bool group_bundle;
         bool support_rtx;
@@ -723,6 +727,7 @@ public:
         bool support_ulpfec;
         bool ice_lite;
         bool ice_trickle;
+        bool ice2;
         bool ice_renomination;
         std::string ice_ufrag;
         std::string ice_pwd;

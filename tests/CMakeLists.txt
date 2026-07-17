@@ -37,7 +37,7 @@ foreach(TEST_SRC ${TEST_SRC_LIST})
 
   if(NOT TARGET ZLMediaKit::WebRTC)
     # 暂时过滤掉依赖 WebRTC 的测试模块
-    if("${TEST_EXE_NAME}" MATCHES "test_rtcp_nack|test_webrtc_regression")
+    if("${TEST_EXE_NAME}" MATCHES "test_rtcp_nack|test_webrtc_regression|test_http_player_auto_detect")
       continue()
     endif()
   endif()
@@ -60,6 +60,16 @@ foreach(TEST_SRC ${TEST_SRC_LIST})
   else()
     target_link_libraries(${TEST_EXE_NAME} ${MK_LINK_LIBRARIES})
   endif()
+
+  # SDP fragment 解析器不依赖 libsrtp，因此即使完整 WebRTC 传输被禁用，
+  # 仍应保留该单元测试。
+  if("${TEST_EXE_NAME}" MATCHES "test_whip_whep_protocol" AND NOT TARGET ZLMediaKit::WebRTC)
+    target_sources(${TEST_EXE_NAME}
+      PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../webrtc/WhipWhepProtocol.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../webrtc/WhipWhepHttpRequester.cpp)
+  endif()
+
 endforeach()
 
 if(TARGET test_rtp_pcap)

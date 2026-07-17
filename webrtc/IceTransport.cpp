@@ -1104,24 +1104,81 @@ void IceAgent::gatheringCandidate(const CandidateTuple::Ptr& candidate_tuple, bo
 }
 
 void IceAgent::connectivityCheck(CandidateInfo& candidate) {
-    TraceL << candidate.dumpString();
-    setState(IceAgent::State::Running);
-    auto ret = _remote_candidates.emplace(candidate);
-    if (ret.second) {
-        bool udp = candidate._transport == CandidateTuple::TransportType::UDP;
-        for (auto& socket : _socket_candidate_manager._host_sockets) {
-            if (udp != (socket->getSock()->sockType() == SockNum::Sock_UDP)) {
-                continue;
-            }
-            auto pair = std::make_shared<Pair>(socket, candidate._addr._host, candidate._addr._port);
-            addToChecklist(pair, candidate);
-        }
+    addRemoteCandidate(candidate, true);
+}
 
-        if (_socket_candidate_manager._has_relayed_candidate) {
-            localRelayedConnectivityCheck(candidate);
-        }
+bool IceAgent::addRemoteCandidate(const CandidateInfo& candidate, bool run_connectivity_check) {
+    if (candidate._type == CandidateInfo::AddressType::INVALID || candidate._addr._host.empty() || candidate._addr._port == 0) {
+        return false;
     }
 
+    const auto result = _remote_candidates.emplace(candidate);
+    if (!result.second) {
+        return true;
+    }
+
+    // ICE Lite 是被动端：远端候选仅用于诊断和代次记录，不能触发主动连通性检查；
+    // 候选提名由对端的 Binding 请求驱动。
+    if (run_connectivity_check && _implementation == Implementation::Full) {
+        CandidateInfo candidate_for_check = *result.first;
+        startConnectivityCheck(candidate_for_check);
+    }
+    return true;
+}
+
+bool IceAgent::restart(std::string ufrag, std::string password, const std::vector<CandidateInfo>& remote_candidates) {
+    if (ufrag.empty() || password.empty()) {
+        return false;
+    }
+
+    CandidateSet next_remote_candidates;
+    for (const auto& candidate : remote_candidates) {
+        if (candidate._type == CandidateInfo::AddressType::INVALID || candidate._addr._host.empty() || candidate._addr._port == 0) {
+            return false;
+        }
+        next_remote_candidates.emplace(candidate);
+    }
+
+    _response_handlers.clear();
+    _permissions.clear();
+    _channel_bindings.clear();
+    _channel_binding_times.clear();
+    _remote_candidates.swap(next_remote_candidates);
+    _check_list.clear();
+    _valid_list.clear();
+    _select_candidate_pair.reset();
+    _selected_pair.reset();
+    _nominated_pair.reset();
+    _nominated_response.reset();
+    _last_selected_pair.reset();
+    _ufrag.swap(ufrag);
+    _password.swap(password);
+    _state = State::Running;
+
+    if (_implementation == Implementation::Full) {
+        for (const auto& candidate : _remote_candidates) {
+            CandidateInfo candidate_for_check = candidate;
+            startConnectivityCheck(candidate_for_check);
+        }
+    }
+    return true;
+}
+
+void IceAgent::startConnectivityCheck(CandidateInfo& candidate) {
+    TraceL << candidate.dumpString();
+    setState(IceAgent::State::Running);
+    const bool udp = candidate._transport == CandidateTuple::TransportType::UDP;
+    for (auto& socket : _socket_candidate_manager._host_sockets) {
+        if (udp != (socket->getSock()->sockType() == SockNum::Sock_UDP)) {
+            continue;
+        }
+        auto pair = std::make_shared<Pair>(socket, candidate._addr._host, candidate._addr._port);
+        addToChecklist(pair, candidate);
+    }
+
+    if (_socket_candidate_manager._has_relayed_candidate) {
+        localRelayedConnectivityCheck(candidate);
+    }
 }
 
 void IceAgent::localRelayedConnectivityCheck(CandidateInfo& candidate) {

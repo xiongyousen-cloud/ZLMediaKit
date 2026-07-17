@@ -35,6 +35,9 @@ public:
     void teardown() override;
     void pause(bool pause) override;
     void speed(float speed) override;
+    void setSocketCreator(toolkit::Socket::onCreateSocket cb) override {
+        setWhipWhepSocketCreator(std::move(cb));
+    }
 
     std::shared_ptr<toolkit::SockInfo> getSockInfo() const override { 
         return getWebRtcTransport() ? getWebRtcTransport()->getSession() : nullptr;
@@ -52,6 +55,10 @@ protected:
     bool isPlayer() override {return true;}
     float getTimeOutSec() override;
     void onNegotiateFinish() override;
+    std::string getWhipWhepCustomHeader() override { return (*this)[Client::kCustomHeader]; }
+    std::string getWhipWhepTrustedOrigins() override { return (*this)[Client::kWhipWhepTrustedOrigins]; }
+    std::string getWhipWhepProxyUrl() override { return (*this)[Client::kProxyUrl]; }
+    std::string getWhipWhepNetAdapter() override { return (*this)[Client::kNetAdapter]; }
 
 protected:
     //是否为性能测试模式

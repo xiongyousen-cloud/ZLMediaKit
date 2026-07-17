@@ -121,14 +121,16 @@ API_EXPORT void API_CALL mk_proxy_player_release(mk_proxy_player ctx);
 /**
  * 设置代理播放器配置选项
  * @param ctx 代理播放器指针
- * @param key 配置项键,支持 net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed
+ * @param key 配置项键,支持 net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed/schema/custom_header/whip_whep_trusted_origins
+ *            custom_header使用Header=Value&Header2=Value2格式；whip_whep_trusted_origins是逗号分隔的绝对origin，且不能允许TLS降级
  *            以及进程内转码参数 in_process_transcode/transcode.codec/transcode.encoder/transcode.width/transcode.height
  *            /transcode.fps/transcode.bitrate/transcode.gop/transcode.threads/transcode.decode_threads/transcode.preset
  *            /transcode.profile/transcode.pixel_format/transcode.zerolatency/transcode.max_b_frames
  * @param val 配置项值,如果是整形，需要转换成统一转换成string
  * Set proxy player configuration options
  * @param ctx Proxy player pointer
- * @param key Configuration item key, supports net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed
+ * @param key Configuration item key, supports net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/rtsp_speed/schema/custom_header/whip_whep_trusted_origins. Unknown HTTP(S) URLs use an SDP HEAD probe; schema=whep skips it. whip_whep_trusted_origins is a comma-separated list of absolute origins and never permits TLS downgrade.
+ *            custom_header uses Header=Value&Header2=Value2 form.
  *            and in-process transcode options: in_process_transcode/transcode.codec/transcode.encoder/transcode.width/transcode.height
  *            /transcode.fps/transcode.bitrate/transcode.gop/transcode.threads/transcode.decode_threads/transcode.preset
  *            /transcode.profile/transcode.pixel_format/transcode.zerolatency/transcode.max_b_frames
@@ -141,10 +143,10 @@ API_EXPORT void API_CALL mk_proxy_player_set_option(mk_proxy_player ctx, const c
 /**
  * 开始播放
  * @param ctx 对象指针
- * @param url 播放url,支持rtsp/rtmp
+ * @param url 播放url,支持rtsp/rtmp及标准http(s) WHEP地址
  * Start playback
  * @param ctx Object pointer
- * @param url Playback url, supports rtsp/rtmp
+ * @param url Playback URL, supporting rtsp/rtmp and standard HTTP(S) WHEP endpoints
  
  * [AUTO-TRANSLATED:9597bafb]
  */

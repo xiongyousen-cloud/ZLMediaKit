@@ -422,6 +422,7 @@ const string kSchema = "schema";
 const string kLatency = "latency";
 const string kPassPhrase = "passPhrase";
 const string kCustomHeader = "custom_header";
+const string kWhipWhepTrustedOrigins = "whip_whep_trusted_origins";
 } // namespace Client
 
 } // namespace mediakit

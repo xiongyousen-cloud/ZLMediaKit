@@ -41,9 +41,9 @@ typedef void(API_CALL *on_mk_play_event)(void *user_data, int err_code, const ch
                                          int track_count);
 
 /**
- * 创建一个播放器,支持rtmp[s]/rtsp[s]
+ * 创建一个播放器,支持rtmp[s]/rtsp[s]及标准http(s) WHEP地址
  * @return 播放器指针
- * Create a player that supports rtmp[s]/rtsp[s]
+ * Create a player that supports rtmp[s]/rtsp[s] and standard HTTP(S) WHEP endpoints
  * @return Player pointer
  
  * [AUTO-TRANSLATED:509f9a50]
@@ -63,11 +63,13 @@ API_EXPORT void API_CALL mk_player_release(mk_player ctx);
 /**
  * 设置播放器配置选项
  * @param ctx 播放器指针
- * @param key 配置项键,支持 net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/wait_track_ready
+ * @param key 配置项键,支持 net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/wait_track_ready/schema/custom_header/whip_whep_trusted_origins
+ *            custom_header使用Header=Value&Header2=Value2格式；whip_whep_trusted_origins是逗号分隔的绝对origin，且不能允许TLS降级
  * @param val 配置项值,如果是整形，需要转换成统一转换成string
  * Set player configuration options
  * @param ctx Player pointer
- * @param key Configuration key, supports net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/wait_track_ready
+ * @param key Configuration key, supports net_adapter/rtp_type/rtsp_user/rtsp_pwd/protocol_timeout_ms/media_timeout_ms/beat_interval_ms/wait_track_ready/schema/custom_header/whip_whep_trusted_origins. Unknown HTTP(S) URLs use an SDP HEAD probe; schema=whep skips it. whip_whep_trusted_origins is a comma-separated list of absolute origins and never permits TLS downgrade.
+ *            custom_header uses Header=Value&Header2=Value2 form.
  * @param val Configuration value, if it is an integer, it needs to be converted to a string
  
  * [AUTO-TRANSLATED:12650e9f]
@@ -77,10 +79,10 @@ API_EXPORT void API_CALL mk_player_set_option(mk_player ctx, const char *key, co
 /**
  * 开始播放url
  * @param ctx 播放器指针
- * @param url rtsp[s]/rtmp[s] url
+ * @param url rtsp[s]/rtmp[s] url或标准http(s) WHEP地址；未知HTTP地址先执行HEAD探测，schema=whep可跳过探测
  * Start playing the url
  * @param ctx Player pointer
- * @param url rtsp[s]/rtmp[s] url
+ * @param url rtsp[s]/rtmp[s] URL or standard HTTP(S) WHEP endpoint; unknown HTTP URLs are probed with HEAD unless schema=whep is set
  
  * [AUTO-TRANSLATED:dbec813f]
  */

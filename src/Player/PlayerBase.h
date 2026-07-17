@@ -178,7 +178,7 @@ public:
      * [AUTO-TRANSLATED:8fb31d43]
      */
     virtual void setOnResume(const std::function<void()> &cb) = 0;
-   
+
     virtual size_t getRecvSpeed() { return 0; }
     virtual size_t getRecvTotalBytes() { return 0; }
     virtual std::shared_ptr<toolkit::SockInfo> getSockInfo() const { return nullptr; } 
@@ -187,6 +187,13 @@ protected:
     virtual void onResume() = 0;
     virtual void onShutdown(const toolkit::SockException &ex) = 0;
     virtual void onPlayResult(const toolkit::SockException &ex) = 0;
+
+public:
+    /**
+     * 设置客户端 socket 创建器；放在既有虚函数之后以保留原有 vtable slot。
+     * Set the client socket creator; declared after existing virtuals to preserve their vtable slots.
+     */
+    virtual void setSocketCreator(toolkit::Socket::onCreateSocket cb);
 };
 
 template<typename Parent, typename Delegate>
@@ -255,6 +262,15 @@ public:
         _media_src = src;
     }
 
+    void setSocketCreator(toolkit::Socket::onCreateSocket cb) override {
+        _on_create_socket = std::move(cb);
+        if (_delegate) {
+            _delegate->setSocketCreator(_on_create_socket);
+        } else {
+            Parent::setSocketCreator(_on_create_socket);
+        }
+    }
+
     void setOnShutdown(const std::function<void(const toolkit::SockException &)> &cb) override {
         if (_delegate) {
             _delegate->setOnShutdown(cb);
@@ -310,6 +326,7 @@ protected:
     PlayerBase::Event _on_shutdown;
     PlayerBase::Event _on_play_result;
     MediaSource::Ptr _media_src;
+    toolkit::Socket::onCreateSocket _on_create_socket;
     std::shared_ptr<Delegate> _delegate;
 };
 

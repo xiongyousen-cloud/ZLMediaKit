@@ -31,6 +31,10 @@ HttpSession::HttpSession(const Socket::Ptr &pSock) : Session(pSock) {
 }
 
 void HttpSession::onHttpRequest_HEAD() {
+    if (emitHttpEvent(false)) {
+        return;
+    }
+
     // 暂时全部返回200 OK，因为HTTP GET存在按需生成流的操作，所以不能按照HTTP GET的流程返回  [AUTO-TRANSLATED:0ce05db5]
     // Temporarily return 200 OK for all, because HTTP GET has on-demand generation stream operations, so it cannot return according to the HTTP GET process
     // 如果直接返回404，那么又会导致按需生成流的逻辑失效，所以HTTP HEAD在静态文件或者已存在资源时才有效  [AUTO-TRANSLATED:ea2b6faa]
@@ -41,17 +45,21 @@ void HttpSession::onHttpRequest_HEAD() {
 }
 
 void HttpSession::onHttpRequest_OPTIONS() {
+    if (emitHttpEvent(false)) {
+        return;
+    }
+
     KeyValue header;
-    header.emplace("Allow", "GET, POST, PUT, HEAD, OPTIONS, DELETE");
+    header.emplace("Allow", "GET, POST, PUT, PATCH, HEAD, OPTIONS, DELETE");
     GET_CONFIG(bool, allow_cross_domains, Http::kAllowCrossDomains);
     if (allow_cross_domains) {
         header.emplace("Access-Control-Allow-Origin", "*");
         header.emplace("Access-Control-Allow-Headers", "*");
-        header.emplace("Access-Control-Allow-Methods", "GET, POST, PUT, HEAD, OPTIONS, DELETE");
+        header.emplace("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, HEAD, OPTIONS, DELETE");
     }
     header.emplace("Access-Control-Allow-Credentials", "true");
-    header.emplace("Access-Control-Request-Methods", "GET, POST, PUT, OPTIONS, DELETE");
-    header.emplace("Access-Control-Request-Headers", "Accept,Accept-Language,Content-Language,Content-Type");
+    header.emplace("Access-Control-Request-Methods", "GET, POST, PUT, PATCH, OPTIONS, DELETE");
+    header.emplace("Access-Control-Request-Headers", "Accept,Accept-Language,Content-Language,Content-Type,Authorization,If-Match");
     sendResponse(200, true, nullptr, header);
 }
 
@@ -62,6 +70,7 @@ ssize_t HttpSession::onRecvHeader(const char *header, size_t len) {
         s_func_map.emplace("GET", &HttpSession::onHttpRequest_GET);
         s_func_map.emplace("POST", &HttpSession::onHttpRequest_POST);
         s_func_map.emplace("PUT", &HttpSession::onHttpRequest_POST);
+        s_func_map.emplace("PATCH", &HttpSession::onHttpRequest_POST);
         // DELETE命令用于whip/whep用，只用于触发http api  [AUTO-TRANSLATED:f3b7aaea]
         // DELETE command is used for whip/whep, only used to trigger http api
         s_func_map.emplace("DELETE", &HttpSession::onHttpRequest_POST);
@@ -110,7 +119,7 @@ ssize_t HttpSession::onRecvHeader(const char *header, size_t len) {
     }
 
     HttpBody::Ptr body;
-    if (_parser.method() == "PUT" || _parser.method() == "POST") {
+    if (_parser.method() == "PUT" || _parser.method() == "POST" || _parser.method() == "PATCH") {
         NOTICE_EMIT(BroadcastBeforeHttpRequestArgs, Broadcast::kBroadcastBeforeHttpRequest, _parser, body, *this);
     }
 

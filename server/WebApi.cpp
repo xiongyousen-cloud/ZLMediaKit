@@ -20,7 +20,9 @@
 #endif // _WIN32
 
 #include <functional>
+#include <mutex>
 #include <unordered_map>
+#include <vector>
 #include <regex>
 #include "Util/MD5.h"
 #include "Util/util.h"
@@ -54,6 +56,7 @@
 #endif
 
 #ifdef ENABLE_WEBRTC
+#include <openssl/rand.h>
 #include "../webrtc/WebRtcPlayer.h"
 #include "../webrtc/WebRtcPusher.h"
 #include "../webrtc/WebRtcEchoTest.h"
@@ -61,6 +64,7 @@
 #include "../webrtc/WebRtcSignalingSession.h"
 #include "../webrtc/WebRtcProxyPlayer.h"
 #include "../webrtc/WebRtcProxyPlayerImp.h"
+#include "../webrtc/WhipWhepProtocol.h"
 #endif
 
 #if defined(ENABLE_VERSION)
@@ -100,6 +104,403 @@ using HttpApi = function<void(const Parser &parser, const HttpSession::HttpRespo
 // http api列表  [AUTO-TRANSLATED:a05e9d9d]
 // http api list
 static map<string, HttpApi, StrCaseCompare> s_map_api;
+
+#ifdef ENABLE_WEBRTC
+namespace {
+
+constexpr char kWhipEndpoint[] = "/index/api/whip";
+constexpr char kWhepEndpoint[] = "/index/api/whep";
+
+struct WhipWhepHttpResource {
+    using Ptr = shared_ptr<WhipWhepHttpResource>;
+
+    bool whep = false;
+    string authorization;
+    weak_ptr<WebRtcTransportImp> transport;
+    shared_ptr<WhipWhepSession> session;
+};
+
+class WebRtcWhipWhepIceTransport final : public WhipWhepIceTransport {
+public:
+    explicit WebRtcWhipWhepIceTransport(const WebRtcTransportImp::Ptr &transport) : _transport(transport) {}
+
+    bool hasCurrentIceCredentials(const WhipWhepSdpFrag &fragment) override {
+        return invoke([&](WebRtcTransport &transport) {
+            return transport.hasCurrentWhipWhepIceCredentials(fragment);
+        });
+    }
+
+    bool applyCandidates(const WhipWhepSdpFrag &fragment) override {
+        return invoke([&](WebRtcTransport &transport) { return transport.applyWhipWhepIceFragment(fragment); });
+    }
+
+    bool restartIce(const WhipWhepSdpFrag &remote_fragment, WhipWhepSdpFrag &local_fragment) override {
+        return invoke([&](WebRtcTransport &transport) { return transport.restartWhipWhepIce(remote_fragment, local_fragment); });
+    }
+
+    void close() override {
+        auto transport = _transport.lock();
+        if (transport) {
+            transport->safeShutdown(SockException(Err_shutdown, "WHIP/WHEP resource deleted"));
+        }
+    }
+
+private:
+    template <typename Func>
+    bool invoke(Func &&func) {
+        auto transport = _transport.lock();
+        if (!transport) {
+            return false;
+        }
+
+        bool result = false;
+        try {
+            transport->getPoller()->sync([&]() { result = func(*transport); });
+        } catch (const exception &ex) {
+            WarnL << "WHIP/WHEP ICE operation failed: " << ex.what();
+            return false;
+        }
+        return result;
+    }
+
+private:
+    weak_ptr<WebRtcTransportImp> _transport;
+};
+
+mutex s_whip_whep_mtx;
+unordered_map<string, WhipWhepHttpResource::Ptr> s_whip_whep_resources;
+
+bool isWhipWhepEndpoint(const string &url, bool &whep) {
+    if (url == kWhipEndpoint) {
+        whep = false;
+        return true;
+    }
+    if (url == kWhepEndpoint) {
+        whep = true;
+        return true;
+    }
+    return false;
+}
+
+bool parseWhipWhepResourcePath(const string &url, bool &whep, string &resource_id) {
+    static const string whip_prefix = string(kWhipEndpoint) + "/";
+    static const string whep_prefix = string(kWhepEndpoint) + "/";
+    const string *prefix = nullptr;
+    if (url.compare(0, whip_prefix.size(), whip_prefix) == 0) {
+        whep = false;
+        prefix = &whip_prefix;
+    } else if (url.compare(0, whep_prefix.size(), whep_prefix) == 0) {
+        whep = true;
+        prefix = &whep_prefix;
+    } else {
+        return false;
+    }
+    resource_id.assign(url, prefix->size(), string::npos);
+    return !resource_id.empty() && resource_id.find('/') == string::npos;
+}
+
+bool isWhipWhepHttpPath(const string &url) {
+    bool whep = false;
+    string resource_id;
+    return isWhipWhepEndpoint(url, whep) || parseWhipWhepResourcePath(url, whep, resource_id);
+}
+
+string makeWhipWhepEtag() {
+    vector<unsigned char> random(16);
+    if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+        throw runtime_error("failed to generate a secure WHIP/WHEP ETag");
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    string value;
+    value.reserve(random.size() * 2 + 2);
+    value.push_back('"');
+    for (const auto byte : random) {
+        value.push_back(kHex[byte >> 4]);
+        value.push_back(kHex[byte & 0x0F]);
+    }
+    value.push_back('"');
+    return value;
+}
+
+void addWhipWhepCorsHeaders(const Parser &parser, HttpSession::KeyValue &header) {
+    header.emplace("Access-Control-Allow-Methods", "POST, PATCH, DELETE, GET, HEAD, OPTIONS");
+    header.emplace("Access-Control-Allow-Headers", "Content-Type, Authorization, If-Match");
+    header.emplace("Access-Control-Expose-Headers", "Location, ETag, Link, Accept-Post, Accept-Patch");
+    GET_CONFIG(bool, allow_cross_domains, Http::kAllowCrossDomains);
+    if (allow_cross_domains && !parser["Origin"].empty()) {
+        header.emplace("Access-Control-Allow-Origin", parser["Origin"]);
+        header.emplace("Access-Control-Allow-Credentials", "true");
+        header.emplace("Vary", "Origin");
+    }
+}
+
+void addWhipWhepCommonHeaders(const Parser &parser, HttpSession::KeyValue &header) {
+    addWhipWhepCorsHeaders(parser, header);
+    header.emplace("Cache-Control", "no-store");
+}
+
+void respondWhipWhep(const Parser &parser,
+                     const HttpSession::HttpResponseInvoker &invoker,
+                     int code,
+                     HttpSession::KeyValue header,
+                     const string &body = "") {
+    addWhipWhepCommonHeaders(parser, header);
+    // HttpSession 会把 HEAD 分发给 API 监听器；这里直接抑制响应体，
+    // 不套用静态文件处理器的通用 HEAD 行为。
+    invoker(code, header, parser.method() == "HEAD" ? string() : body);
+}
+
+void respondWhipWhepError(const Parser &parser,
+                          const HttpSession::HttpResponseInvoker &invoker,
+                          int code,
+                          const string &message,
+                          HttpSession::KeyValue header = {}) {
+    header.emplace("Content-Type", "text/plain; charset=utf-8");
+    respondWhipWhep(parser, invoker, code, std::move(header), message);
+}
+
+void respondWhipWhepMethodNotAllowed(const Parser &parser,
+                                     const HttpSession::HttpResponseInvoker &invoker,
+                                     const string &allow) {
+    HttpSession::KeyValue header;
+    header.emplace("Allow", allow);
+    respondWhipWhepError(parser, invoker, 405, "method is not allowed for this WHIP/WHEP resource", std::move(header));
+}
+
+WhipWhepHttpResource::Ptr findWhipWhepResource(const string &resource_id) {
+    lock_guard<mutex> lock(s_whip_whep_mtx);
+    const auto it = s_whip_whep_resources.find(resource_id);
+    if (it == s_whip_whep_resources.end()) {
+        return nullptr;
+    }
+    if (it->second->transport.expired()) {
+        s_whip_whep_resources.erase(it);
+        return nullptr;
+    }
+    return it->second;
+}
+
+string addWhipWhepResource(WhipWhepHttpResource::Ptr resource) {
+    lock_guard<mutex> lock(s_whip_whep_mtx);
+    string id;
+    do {
+        vector<unsigned char> random(16);
+        if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+            throw runtime_error("failed to generate a secure WHIP/WHEP resource ID");
+        }
+        static constexpr char kHex[] = "0123456789abcdef";
+        id.clear();
+        id.reserve(random.size() * 2);
+        for (const auto byte : random) {
+            id.push_back(kHex[byte >> 4]);
+            id.push_back(kHex[byte & 0x0F]);
+        }
+    } while (s_whip_whep_resources.count(id));
+    s_whip_whep_resources.emplace(id, std::move(resource));
+    return id;
+}
+
+void removeWhipWhepResource(const string &resource_id) {
+    lock_guard<mutex> lock(s_whip_whep_mtx);
+    s_whip_whep_resources.erase(resource_id);
+}
+
+bool hasWhipWhepAuthorization(const WhipWhepHttpResource &resource, const Parser &parser) {
+    // 后续资源请求必须使用创建会话时相同的 Authorization；真正的鉴权仍由
+    // 初始 offer 经过的现有推流/播放鉴权钩子完成。
+    return resource.authorization == parser["Authorization"];
+}
+
+void handleWhipWhepEndpoint(bool whep,
+                            const Parser &parser,
+                            const HttpSession::HttpResponseInvoker &invoker,
+                            SockInfo &sender) {
+    if (parser.method() == "OPTIONS") {
+        HttpSession::KeyValue header;
+        header.emplace("Allow", whep ? "POST, GET, HEAD, OPTIONS" : "POST, GET, OPTIONS");
+        header.emplace("Accept-Post", "application/sdp");
+        respondWhipWhep(parser, invoker, 200, std::move(header));
+        return;
+    }
+    if (parser.method() == "GET") {
+        respondWhipWhep(parser, invoker, 204, {});
+        return;
+    }
+    if (parser.method() == "HEAD" && whep) {
+        HttpSession::KeyValue header;
+        header.emplace("Content-Type", "application/sdp");
+        respondWhipWhep(parser, invoker, 200, std::move(header));
+        return;
+    }
+    if (parser.method() != "POST") {
+        respondWhipWhepMethodNotAllowed(parser, invoker, whep ? "POST, GET, HEAD, OPTIONS" : "POST, GET, OPTIONS");
+        return;
+    }
+    if (!WhipWhepProtocol::isSdpContentType(parser["Content-Type"])) {
+        respondWhipWhepError(parser, invoker, 415, "WHIP/WHEP POST requires Content-Type: application/sdp");
+        return;
+    }
+    if (parser.content().empty()) {
+        respondWhipWhepError(parser, invoker, 400, "WHIP/WHEP SDP offer is empty");
+        return;
+    }
+
+    string offer = parser.content();
+    HttpAllArgs<string> all_args(parser, offer);
+    auto args = make_shared<WebRtcArgsImp<string>>(all_args, sender.getIdentifier());
+    auto &socket_helper = static_cast<SocketHelper &>(sender);
+    WebRtcPluginManager::Instance().negotiateSdp(socket_helper, whep ? "play" : "push", *args,
+        [whep, parser, offer, invoker](const WebRtcInterface &exchanger) mutable {
+            auto &handler = const_cast<WebRtcInterface &>(exchanger);
+            WebRtcTransportImp::Ptr transport;
+            try {
+                const auto answer = handler.getAnswerSdp(offer);
+                transport = WebRtcTransportManager::Instance().getItem(exchanger.getIdentifier());
+                if (!transport) {
+                    throw runtime_error("WHIP/WHEP negotiation did not create a WebRTC transport");
+                }
+
+                auto adapter = make_shared<WebRtcWhipWhepIceTransport>(transport);
+                const auto etag = makeWhipWhepEtag();
+                auto protocol_session = make_shared<WhipWhepSession>(etag, adapter, []() { return makeWhipWhepEtag(); });
+                auto resource = make_shared<WhipWhepHttpResource>();
+                resource->whep = whep;
+                resource->authorization = parser["Authorization"];
+                resource->transport = transport;
+                resource->session = std::move(protocol_session);
+                const auto resource_id = addWhipWhepResource(std::move(resource));
+                transport->setOnShutdown([resource_id](const SockException &) {
+                    removeWhipWhepResource(resource_id);
+                });
+
+                HttpSession::KeyValue header;
+                header.emplace("Content-Type", "application/sdp");
+                header.emplace("Location", string(whep ? kWhepEndpoint : kWhipEndpoint) + "/" + resource_id);
+                header.emplace("ETag", etag);
+                header.emplace("Accept-Patch", "application/trickle-ice-sdpfrag");
+                header.emplace("Accept-Post", "application/sdp");
+                respondWhipWhep(parser, invoker, 201, std::move(header), answer);
+            } catch (const exception &ex) {
+                if (transport) {
+                    transport->safeShutdown(SockException(Err_shutdown, "WHIP/WHEP negotiation failed"));
+                }
+                HttpSession::KeyValue header;
+                if (whep && string(ex.what()) == "stream not found") {
+                    header.emplace("Retry-After", "1");
+                    respondWhipWhepError(parser, invoker, 409, ex.what(), std::move(header));
+                } else {
+                    respondWhipWhepError(parser, invoker, 400, ex.what());
+                }
+            }
+        });
+}
+
+void handleWhipWhepResource(bool whep,
+                            const string &resource_id,
+                            const Parser &parser,
+                            const HttpSession::HttpResponseInvoker &invoker) {
+    auto resource = findWhipWhepResource(resource_id);
+    if (!resource || resource->whep != whep) {
+        respondWhipWhepError(parser, invoker, 404, "WHIP/WHEP resource was not found");
+        return;
+    }
+
+    // CORS 预检按规范不携带 Bearer token，必须在会话鉴权前处理。
+    if (parser.method() == "OPTIONS") {
+        HttpSession::KeyValue header;
+        header.emplace("Allow", whep ? "GET, HEAD, PATCH, DELETE, OPTIONS" : "GET, PATCH, DELETE, OPTIONS");
+        header.emplace("Accept-Patch", "application/trickle-ice-sdpfrag");
+        respondWhipWhep(parser, invoker, 200, std::move(header));
+        return;
+    }
+    if (!hasWhipWhepAuthorization(*resource, parser)) {
+        HttpSession::KeyValue header;
+        header.emplace("WWW-Authenticate", "Bearer");
+        respondWhipWhepError(parser, invoker, 401, "WHIP/WHEP resource authorization does not match", std::move(header));
+        return;
+    }
+
+    if (parser.method() == "GET") {
+        respondWhipWhep(parser, invoker, 204, {});
+        return;
+    }
+    if (parser.method() == "HEAD" && whep) {
+        HttpSession::KeyValue header;
+        header.emplace("Content-Type", "application/sdp");
+        respondWhipWhep(parser, invoker, 200, std::move(header));
+        return;
+    }
+    if (parser.method() == "DELETE") {
+        removeWhipWhepResource(resource_id);
+        resource->session->close();
+        respondWhipWhep(parser, invoker, 200, {});
+        return;
+    }
+    if (parser.method() != "PATCH") {
+        respondWhipWhepMethodNotAllowed(parser, invoker,
+            whep ? "GET, HEAD, PATCH, DELETE, OPTIONS" : "GET, PATCH, DELETE, OPTIONS");
+        return;
+    }
+    if (!WhipWhepProtocol::isTrickleIceSdpFragContentType(parser["Content-Type"])) {
+        if (whep && WhipWhepProtocol::isSdpContentType(parser["Content-Type"])) {
+            respondWhipWhepError(parser, invoker, 422, "WHEP SDP answers are only valid after a server counter-offer");
+        } else {
+            respondWhipWhepError(parser, invoker, 415, "WHIP/WHEP PATCH requires Content-Type: application/trickle-ice-sdpfrag");
+        }
+        return;
+    }
+
+    WhipWhepPatchResult result;
+    try {
+        result = resource->session->applyPatch(WhipWhepSdpFrag::parse(parser.content()), parser["If-Match"]);
+    } catch (const exception &ex) {
+        respondWhipWhepError(parser, invoker, 400, ex.what());
+        return;
+    }
+
+    HttpSession::KeyValue header;
+    switch (result.status) {
+        case WhipWhepPatchStatus::Applied:
+            respondWhipWhep(parser, invoker, 204, std::move(header));
+            return;
+        case WhipWhepPatchStatus::Restarted:
+            header.emplace("Content-Type", "application/trickle-ice-sdpfrag");
+            header.emplace("ETag", result.etag);
+            respondWhipWhep(parser, invoker, 200, std::move(header), result.response_fragment.toString());
+            return;
+        case WhipWhepPatchStatus::PreconditionRequired:
+            respondWhipWhepError(parser, invoker, 428, "If-Match is required for a trickle ICE PATCH");
+            return;
+        case WhipWhepPatchStatus::PreconditionFailed:
+            respondWhipWhepError(parser, invoker, 412, "WHIP/WHEP If-Match precondition failed");
+            return;
+        case WhipWhepPatchStatus::Unsupported:
+            respondWhipWhepError(parser, invoker, 422, "WHIP/WHEP ICE update is not supported by this transport");
+            return;
+        case WhipWhepPatchStatus::Closed:
+            removeWhipWhepResource(resource_id);
+            respondWhipWhepError(parser, invoker, 410, "WHIP/WHEP resource is closed");
+            return;
+    }
+}
+
+void handleWhipWhepHttpRequest(const Parser &parser,
+                               const HttpSession::HttpResponseInvoker &invoker,
+                               SockInfo &sender) {
+    bool whep = false;
+    if (isWhipWhepEndpoint(parser.url(), whep)) {
+        handleWhipWhepEndpoint(whep, parser, invoker, sender);
+        return;
+    }
+
+    string resource_id;
+    if (parseWhipWhepResourcePath(parser.url(), whep, resource_id)) {
+        handleWhipWhepResource(whep, resource_id, parser, invoker);
+    }
+}
+
+} // namespace
+#endif // ENABLE_WEBRTC
 
 static void responseApi(int code, const string &msg, const HttpSession::HttpResponseInvoker &invoker, ApiRetException *ex = nullptr){
     Json::Value res;
@@ -282,8 +683,27 @@ static inline void addHttpListener(){
     // 注册监听kBroadcastHttpRequest事件  [AUTO-TRANSLATED:4af22c90]
     // Register to listen for the kBroadcastHttpRequest event
     NoticeCenter::Instance().addListener(&web_api_tag, Broadcast::kBroadcastHttpRequest, [](BroadcastHttpRequestArgs) {
+#ifdef ENABLE_WEBRTC
+        const bool whip_whep_path = isWhipWhepHttpPath(parser.url());
+#else
+        const bool whip_whep_path = false;
+#endif
+        if (!whip_whep_path
+            && (parser.method() == "HEAD" || parser.method() == "OPTIONS" || parser.method() == "PATCH")) {
+            return;
+        }
+
         auto it = s_map_api.find(parser.url());
-        if (it == s_map_api.end()) {
+        HttpApi api;
+        if (it != s_map_api.end()) {
+            api = it->second;
+        }
+#ifdef ENABLE_WEBRTC
+        else if (whip_whep_path) {
+            api = handleWhipWhepHttpRequest;
+        }
+#endif // ENABLE_WEBRTC
+        if (!api) {
             return;
         }
         // 该api已被消费  [AUTO-TRANSLATED:db0872fc]
@@ -302,17 +722,35 @@ static inline void addHttpListener(){
                 }
 
                 LogContextCapture log(getLogger(), toolkit::LDebug, __FILE__, "http api debug", __LINE__);
-                log << "\r\n# request:\r\n" << parser.method() << " " << parser.fullUrl() << "\r\n";
+                string request_target = parser.url();
+                if (!parser.getUrlArgs().empty()) {
+                    request_target += "?<redacted>";
+                }
+                log << "\r\n# request:\r\n" << parser.method() << " " << request_target << "\r\n";
                 log << "# header:\r\n";
 
                 for (auto &pr : parser.getHeader()) {
-                    log << pr.first << " : " << pr.second << "\r\n";
+                    const bool sensitive = !strcasecmp(pr.first.c_str(), "Authorization")
+                        || !strcasecmp(pr.first.c_str(), "Proxy-Authorization")
+                        || !strcasecmp(pr.first.c_str(), "Cookie")
+                        || !strcasecmp(pr.first.c_str(), "Set-Cookie")
+                        || !strcasecmp(pr.first.c_str(), "X-Api-Key");
+                    log << pr.first << " : " << (sensitive ? "<redacted>" : pr.second) << "\r\n";
                 }
 
                 auto &content = parser.content();
-                log << "# content:\r\n" << (content.size() > 4 * 1024 ? content.substr(0, 4 * 1024) : content) << "\r\n";
+#ifdef ENABLE_WEBRTC
+                const bool sensitive_sdp = isWhipWhepHttpPath(parser.url());
+#else
+                const bool sensitive_sdp = false;
+#endif
+                if (sensitive_sdp) {
+                    log << "# content: <redacted SDP, bytes=" << content.size() << ">\r\n";
+                } else {
+                    log << "# content:\r\n" << (content.size() > 4 * 1024 ? content.substr(0, 4 * 1024) : content) << "\r\n";
+                }
 
-                if (size > 0 && size < 4 * 1024) {
+                if (!sensitive_sdp && size > 0 && size < 4 * 1024) {
                     auto response = body->readData(size);
                     log << "# response:\r\n" << response->data() << "\r\n";
                     invoker(code, headerOut, response);
@@ -325,9 +763,9 @@ static inline void addHttpListener(){
         }
         auto helper = static_cast<SocketHelper &>(sender).shared_from_this();
         // 在本poller线程下一次事件循环时执行http api，防止占用NoticeCenter的锁
-        helper->getPoller()->async([it, parser, invoker, helper]() {
+        helper->getPoller()->async([api, parser, invoker, helper]() {
             try {
-                it->second(parser, invoker, *helper);
+                api(parser, invoker, *helper);
             } catch (ApiRetException &ex) {
                 responseApi(ex.code(), ex.what(), invoker, &ex);
                 helper->getPoller()->async([helper, ex]() { helper->shutdown(SockException(Err_shutdown, ex.what())); }, false);
@@ -2205,34 +2643,6 @@ void installWebApi() {
     });
 
     static constexpr char delete_webrtc_url [] = "/index/api/delete_webrtc";
-    static auto whip_whep_func = [](const char *type, API_ARGS_STRING_ASYNC) {
-        auto offer = allArgs.args;
-        CHECK(!offer.empty(), "http body(webrtc offer sdp) is empty");
-
-        auto &session = static_cast<Session&>(sender);
-        auto location = std::string(session.overSsl() ? "https://" : "http://") + allArgs["host"] + delete_webrtc_url;
-        auto args = std::make_shared<WebRtcArgsImp<std::string>>(allArgs, sender.getIdentifier());
-        WebRtcPluginManager::Instance().negotiateSdp(session, type, *args, [invoker, offer, headerOut, location](const WebRtcInterface &exchanger) mutable {
-            auto &handler = const_cast<WebRtcInterface &>(exchanger);
-            try {
-                // Encode query params since transport id/token may contain '+' or '/'.
-                HttpArgs delete_args;
-                delete_args["id"] = exchanger.getIdentifier();
-                delete_args["token"] = exchanger.deleteRandStr();
-                // 设置返回类型  [AUTO-TRANSLATED:ffc2a31a]
-                // Set return type
-                headerOut["Content-Type"] = "application/sdp";
-                headerOut["Location"] = location + "?" + delete_args.make();
-                invoker(201, headerOut, handler.getAnswerSdp(offer));
-            } catch (std::exception &ex) {
-                headerOut["Content-Type"] = "text/plain";
-                invoker(406, headerOut, ex.what());
-            }
-        });
-    };
-
-    api_regist("/index/api/whip", [](API_ARGS_STRING_ASYNC) { whip_whep_func("push", API_ARGS_VALUE, invoker); });
-    api_regist("/index/api/whep", [](API_ARGS_STRING_ASYNC) { whip_whep_func("play", API_ARGS_VALUE, invoker); });
 
     api_regist(delete_webrtc_url, [](API_ARGS_MAP_ASYNC) {
         CHECK_ARGS("id", "token");

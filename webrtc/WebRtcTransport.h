@@ -11,9 +11,12 @@
 #ifndef ZLMEDIAKIT_WEBRTC_TRANSPORT_H
 #define ZLMEDIAKIT_WEBRTC_TRANSPORT_H
 
-#include <memory>
-#include <string>
+#include <cstdint>
 #include <functional>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 #include "DtlsTransport.hpp"
 #include "IceTransport.hpp"
 #include "SrtpSession.hpp"
@@ -31,6 +34,8 @@
 
 using namespace RTC;
 namespace mediakit {
+
+struct WhipWhepSdpFrag;
 
 // ICE transport policy enum
 enum class IceTransportPolicy {
@@ -115,6 +120,12 @@ public:
     };
     static const char* RoleStr(Role role);
 
+    enum class LocalSdpRole : uint8_t {
+        Unset,
+        Offer,
+        Answer,
+    };
+
     enum class SignalingProtocols {
         Invalid   = -1,
         WHEP_WHIP = 0,
@@ -136,6 +147,14 @@ public:
     const RtcSession::Ptr& answerSdp() const {
         return _answer_sdp;
     }
+
+    LocalSdpRole localSdpRole() const { return _local_sdp_role; }
+    const RtcSession::Ptr &localSdp() const;
+    const RtcSession::Ptr &remoteSdp() const;
+    const RtcMedia *localMedia(TrackType type) const;
+    const RtcMedia *remoteMedia(TrackType type) const;
+    const RtcMedia *localMedia(const std::string &mid) const;
+    const RtcMedia *remoteMedia(const std::string &mid) const;
 
     std::string createOfferSdp() override;
 
@@ -173,6 +192,12 @@ public:
     void gatheringCandidate(IceServerInfo::Ptr ice_server, onGatheringCandidateCB cb = nullptr) override;
     void connectivityCheck(SdpAttrCandidate candidate_attr, const std::string &ufrag, const std::string &pwd);
     void connectivityCheckForSFU();
+
+    // 这些操作有意保持同步，且必须在 getPoller() 上调用。WHIP/WHEP HTTP 适配器负责
+    // 请求与 ETag 的串行化，并在调用前将任务派发到该传输的 poller。
+    bool hasCurrentWhipWhepIceCredentials(const WhipWhepSdpFrag &fragment);
+    bool applyWhipWhepIceFragment(const WhipWhepSdpFrag &fragment);
+    bool restartWhipWhepIce(const WhipWhepSdpFrag &remote_fragment, WhipWhepSdpFrag &local_fragment);
 
     void setOnStartWebRTC(std::function<void()> on_start);
 
@@ -222,9 +247,25 @@ protected:
     virtual void onBeforeEncryptRtcp(const char *buf, int &len, void *ctx) = 0;
     virtual void onRtcpBye() = 0;
 
+    // WebRtcTransportImp 持有管理器注册；未注册的基类传输无法安全轮换本地 ICE ufrag。
+    virtual bool prepareIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) { return false; }
+    virtual void commitIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) noexcept {}
+    virtual void rollbackIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) noexcept {}
+    virtual std::string makeIceRestartCredential(size_t bytes) const;
+    virtual bool addWhipWhepRemoteCandidate(const CandidateInfo &candidate);
+    virtual bool restartWhipWhepIceAgent(const std::string &ufrag, const std::string &password,
+                                         const std::vector<CandidateInfo> &remote_candidates);
+
 protected:
     void sendRtcpRemb(uint32_t ssrc, size_t bit_rate);
     void sendRtcpPli(uint32_t ssrc);
+    RtpDirection localDirectionForAnswerMedia(const RtcMedia &answer_media) const;
+    RtpDirection directionForAnswerMedia(const RtcMedia &answer_media, LocalSdpRole local_role) const;
+    LocalSdpRole answerCheckLocalSdpRole() const;
+    DtlsRole localDtlsRole() const;
+    const RTC::DtlsTransport::Fingerprint &remoteDtlsFingerprint() const;
+    std::vector<CandidateInfo> makeRemoteCandidatesForSFU() const;
+    const std::set<std::string> &whipWhepCompletedMids() const { return _whip_whep_completed_mids; }
 
 private:
     void sendSockData(const char *buf, size_t len, const IceTransport::Pair::Ptr& pair = nullptr);
@@ -235,6 +276,8 @@ protected:
     Role _role = Role::PEER;
     RtcSession::Ptr _offer_sdp;
     RtcSession::Ptr _answer_sdp;
+    LocalSdpRole _local_sdp_role = LocalSdpRole::Unset;
+    LocalSdpRole _answer_check_local_sdp_role = LocalSdpRole::Unset;
 
     IceAgent::Ptr _ice_agent;
     onGatheringCandidateCB _on_gathering_candidate = nullptr;
@@ -250,6 +293,7 @@ private:
     // 循环池  [AUTO-TRANSLATED:b7059f37]
     // Cycle pool
     toolkit::ResourcePool<toolkit::BufferRaw> _packet_pool;
+    std::set<std::string> _whip_whep_completed_mids;
 
     //超时功能实现
     toolkit::Ticker _recv_ticker;
@@ -340,6 +384,10 @@ protected:
     void onSendSockData(toolkit::Buffer::Ptr buf, bool flush = true, const IceTransport::Pair::Ptr& pair = nullptr) override;
     void onCheckSdp(SdpType type, RtcSession &sdp) override;
     void onRtcConfigure(RtcConfigure &configure) const override;
+    bool prepareIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) override;
+    void commitIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) noexcept override;
+    void rollbackIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) noexcept override;
+    const MediaTrack *mediaTrack(TrackType type) const;
 
     void onRtp(const char *buf, size_t len, uint64_t stamp_ms) override;
     void onRtcp(const char *buf, size_t len) override;
@@ -370,8 +418,12 @@ private:
     // Total traffic used
     uint64_t _bytes_usage = 0;
     // 保持自我强引用  [AUTO-TRANSLATED:c2dc228f]
-    // Keep self strong reference
     Ptr _self;
+    // 旧传输 ID 与本地 ICE ufrag 有意分离；保留当前已注册的 ufrag，确保析构时即使
+    // 基类已释放代理，仍能删除对应路由项。
+    std::string _registered_ice_ufrag;
+    // prepare 阶段预先分配新 ufrag；commit 仅交换字符串，rollback 不需要重新分配旧 key。
+    std::string _ice_ufrag_change_buffer;
     // 检测超时的定时器  [AUTO-TRANSLATED:a58e1388]
     // Timeout detection timer
     toolkit::Timer::Ptr _timer;
@@ -408,15 +460,24 @@ public:
     friend class WebRtcTransportImp;
     static WebRtcTransportManager &Instance();
     WebRtcTransportImp::Ptr getItem(const std::string &key);
+    WebRtcTransportImp::Ptr getItemByIceUfrag(const std::string &ufrag);
 
 private:
     WebRtcTransportManager() = default;
-    void addItem(const std::string &key, const WebRtcTransportImp::Ptr &ptr);
-    void removeItem(const std::string &key);
+    bool addItem(const std::string &key, const std::string &ice_ufrag, const WebRtcTransportImp::Ptr &ptr);
+    void removeItem(const std::string &key, const std::string &ice_ufrag,
+                    const std::string &buffered_ufrag, const WebRtcTransportImp *ptr);
+    bool prepareIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag,
+                               const WebRtcTransportImp::Ptr &ptr);
+    void commitIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag,
+                              const WebRtcTransportImp *ptr) noexcept;
+    void rollbackIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag,
+                                const WebRtcTransportImp *ptr) noexcept;
 
 private:
     mutable std::mutex _mtx;
     std::unordered_map<std::string, std::weak_ptr<WebRtcTransportImp> > _map;
+    std::unordered_map<std::string, std::weak_ptr<WebRtcTransportImp> > _ice_ufrag_map;
 };
 
 class WebRtcArgs : public std::enable_shared_from_this<WebRtcArgs> {

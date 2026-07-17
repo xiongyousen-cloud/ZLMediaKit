@@ -12,20 +12,62 @@
 #include "Common/config.h"
 #include "Common/Parser.h"
 #include "WebRtcClient.h"
+#include "WhipWhepProtocol.h"
+
+#include <cstdlib>
 
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
 
-// # WebRTCUrl format
-// ## whep/whip over http sfu: webrtc://server_host:server_port/{{app}}/{{streamid}}
+namespace {
+
+string safeOriginForLog(const string &url) {
+    try {
+        return WhipWhepProtocol::canonicalOrigin(url);
+    } catch (const exception &) {
+        return "<invalid-whip-whep-origin>";
+    }
+}
+
+bool isSdpContentType(const string &content_type) {
+    return WhipWhepProtocol::isSdpContentType(content_type);
+}
+
+SockException makeHttpError(const Parser &response, const string &reason) {
+    string message = reason + ", HTTP status: " + response.status();
+    if (!response.content().empty()) {
+        message += ", response bytes: " + to_string(response.content().size());
+    }
+    return SockException(Err_other, std::move(message));
+}
+
+} // namespace
+
+// # WebRTCUrl 格式
+// ## 标准 WHIP/WHEP 端点：http(s)://server_host[:port]/endpoint
+// ## 基于 HTTP SFU 的 WHEP/WHIP：webrtc://server_host:server_port/{{app}}/{{streamid}}
 // ## whep/whip over https sfu: webrtcs://server_host:server_port/{{app}}/{{streamid}}
 // ## websocket p2p: webrtc://{{signaling_server_host}}:{{signaling_server_port}}/{{app}}/{{streamid}}?room_id={{peer_room_id}}
 // ## websockets p2p: webrtcs://{{signaling_server_host}}:{{signaling_server_port}}/{{app}}/{{streamid}}?room_id={{peer_room_id}}
 void WebRTCUrl::parse(const string &strUrl, bool isPlayer) {
-    DebugL << "url: " << strUrl;
+    DebugL << "WebRTC URL origin: " << safeOriginForLog(strUrl);
+
+    _is_ssl = false;
     _full_url = strUrl;
+    _negotiate_url.clear();
+    _delete_url.clear();
+    _target_secret.clear();
+    _params.clear();
+    _host.clear();
+    _port = 0;
+    _vhost.clear();
+    _app.clear();
+    _stream.clear();
+    _peer_room_id.clear();
+    _signaling_protocols = WebRtcTransport::SignalingProtocols::WHEP_WHIP;
+
     auto url = strUrl;
     auto pos = url.find("?");
     if (pos != string::npos) {
@@ -34,17 +76,31 @@ void WebRTCUrl::parse(const string &strUrl, bool isPlayer) {
     }
 
     auto schema_pos = url.find("://");
+    bool is_standard_endpoint = false;
     if (schema_pos != string::npos) {
         auto schema = url.substr(0, schema_pos);
-        _is_ssl = strcasecmp(schema.data(), "webrtcs") == 0;
+        if (strcasecmp(schema.c_str(), "http") == 0 || strcasecmp(schema.c_str(), "https") == 0) {
+            _is_ssl = strcasecmp(schema.c_str(), "https") == 0;
+            is_standard_endpoint = true;
+        } else if (strcasecmp(schema.c_str(), "webrtc") == 0 || strcasecmp(schema.c_str(), "webrtcs") == 0) {
+            _is_ssl = strcasecmp(schema.c_str(), "webrtcs") == 0;
+        } else {
+            throw invalid_argument("unsupported WebRTC URL scheme: " + schema);
+        }
     } else {
+        // 保留历史上无协议头 URL 的解析行为。
         schema_pos = -3;
     }
-    // set default port
+    // 设置默认端口。
     _port = _is_ssl ? 443 : 80;
     auto split_vec = split(url.substr(schema_pos + 3), "/");
     if (split_vec.size() > 0) {
-        splitUrl(split_vec[0], _host, _port);
+        auto authority = split_vec[0];
+        const auto at = authority.rfind('@');
+        if (at != string::npos) {
+            authority.erase(0, at + 1);
+        }
+        splitUrl(authority, _host, _port);
         _vhost = _host;
         if (_vhost == "localhost" || isIP(_vhost.data())) {
             // 如果访问的是localhost或ip，那么则为默认虚拟主机
@@ -84,9 +140,17 @@ void WebRTCUrl::parse(const string &strUrl, bool isPlayer) {
         _peer_room_id = it->second;
     }
 
+    if (is_standard_endpoint) {
+        // HTTP URL 已经是完整的 WHEP/WHIP 端点，不再把路径或查询参数
+        // 重新解释为 ZLMediaKit 私有字段。
+        _signaling_protocols = WebRtcTransport::SignalingProtocols::WHEP_WHIP;
+        _negotiate_url = strUrl;
+        return;
+    }
+
     it = kv.find("signaling_protocols");
     if (it != kv.end()) {
-        _signaling_protocols = (WebRtcTransport::SignalingProtocols)(stoi(it->second));
+        _signaling_protocols = static_cast<WebRtcTransport::SignalingProtocols>(stoi(it->second));
     }
 
     auto suffix = _host + ":" + to_string(_port);
@@ -145,40 +209,212 @@ void WebRtcClient::doNegotiate() {
     }
 }
 
+WhipWhepHttpRequester::Ptr WebRtcClient::createWhipWhepRequester() {
+    return make_shared<WhipWhepHttpRequester>(getPoller());
+}
+
+WhipWhepHttpRequester::Ptr WebRtcClient::makeWhipWhepRequester() {
+    auto requester = createWhipWhepRequester();
+    if (!requester) {
+        throw invalid_argument("invalid WHIP/WHEP requester configuration");
+    }
+    requester->setCustomHeaders(_whip_whep_custom_header);
+    requester->setTrustedOrigins(_whip_whep_trusted_origins);
+    if (_whip_whep_on_create_socket) {
+        requester->setOnCreateSocket(_whip_whep_on_create_socket);
+    }
+    requester->setProxyUrl(getWhipWhepProxyUrl());
+    const auto net_adapter = getWhipWhepNetAdapter();
+    if (!net_adapter.empty()) {
+        requester->setNetAdapter(net_adapter);
+    }
+    return requester;
+}
+
+void WebRtcClient::prepareWhipWhepSecurityState(const string &endpoint_url) {
+    try {
+        auto trusted_origins = WhipWhepProtocol::parseTrustedOrigins(getWhipWhepTrustedOrigins());
+        trusted_origins.emplace(WhipWhepProtocol::canonicalOrigin(endpoint_url));
+        auto custom_header = getWhipWhepCustomHeader();
+        _whip_whep_custom_header = std::move(custom_header);
+        _whip_whep_trusted_origins = std::move(trusted_origins);
+    } catch (const exception &) {
+        throw invalid_argument("invalid WHIP/WHEP trusted origin configuration");
+    }
+}
+
+string WebRtcClient::validateWhipWhepSessionUrl(const string &request_url, const string &location) const {
+    const auto session_url = WhipWhepProtocol::resolveSessionUrl(request_url, location);
+    string policy_error;
+    if (!WhipWhepProtocol::isTargetAllowed(request_url,
+                                           session_url,
+                                           !_whip_whep_custom_header.empty(),
+                                           _whip_whep_trusted_origins,
+                                           policy_error)) {
+        throw invalid_argument(policy_error);
+    }
+    return session_url;
+}
+
+void WebRtcClient::assignWhipWhepSessionUrl(const string &request_url, const string &location) {
+    auto session_url = validateWhipWhepSessionUrl(request_url, location);
+    _url._delete_url = std::move(session_url);
+}
+
+SockException WebRtcClient::getWhipWhepRequestError(
+    const SockException &network_error, const WhipWhepHttpRequester::Ptr &requester) {
+    if (requester && !requester->policyError().empty()) {
+        return SockException(Err_other, requester->policyError());
+    }
+    if (network_error) {
+        return SockException(network_error.getErrCode(), "WHIP/WHEP HTTP request failed");
+    }
+    return SockException();
+}
+
 void WebRtcClient::doNegotiateWhepOrWhip() {
-    DebugL << _url._negotiate_url;
+    DebugL << "WHIP/WHEP negotiate origin: " << safeOriginForLog(_url._negotiate_url);
+
+    try {
+        prepareWhipWhepSecurityState(_url._negotiate_url);
+    } catch (const exception &) {
+        onResult(SockException(Err_other, "invalid WHIP/WHEP trusted origin configuration"));
+        return;
+    }
+
+    WhipWhepHttpRequester::Ptr requester;
+    try {
+        requester = makeWhipWhepRequester();
+    } catch (const exception &) {
+        onResult(SockException(Err_other, "invalid WHIP/WHEP requester configuration"));
+        return;
+    }
 
     weak_ptr<WebRtcClient> weak_self = static_pointer_cast<WebRtcClient>(shared_from_this());
     auto offer_sdp = _transport->createOfferSdp();
-    DebugL << "send offer:\n" << offer_sdp;
+    DebugL << "send WHIP/WHEP offer, bytes: " << offer_sdp.size();
 
-    _negotiate = make_shared<HttpRequester>();
-    _negotiate->setMethod("POST");
-    _negotiate->addHeader("Content-Type", "application/sdp");
-    _negotiate->setBody(std::move(offer_sdp));
-    _negotiate->startRequester(_url._negotiate_url, [weak_self](const toolkit::SockException &ex, const Parser &response) {
-        auto strong_self = weak_self.lock();
-        if (!strong_self) {
-            return;
-        }
-        if (ex) {
-            WarnL << "network err:" << ex;
-            strong_self->onResult(ex);
-            return;
-        }
+    _negotiate = requester;
+    requester->setMethod("POST");
+    requester->setApplicationSdpContentType();
+    requester->setBody(std::move(offer_sdp));
+    try {
+        requester->startRequester(
+            _url._negotiate_url,
+            [weak_self, requester](const toolkit::SockException &ex, const Parser &response) {
+                auto strong_self = weak_self.lock();
+                if (!strong_self) {
+                    return;
+                }
 
-        DebugL << "status:" << response.status() << "\r\n"
-               << "Location:\r\n"
-               << response.getHeader()["Location"] << "\r\nrecv answer:\n"
-               << response.content();
-        strong_self->_url._delete_url = response.getHeader()["Location"];
-        if ("201" != response.status()) {
-            strong_self->onResult(SockException(Err_other, response.content()));
-            return;
-        }
-        strong_self->_transport->setAnswerSdp(response.content());
-        strong_self->onNegotiateFinish();
-    }, getTimeOutSec());
+                const auto request_error = strong_self->getWhipWhepRequestError(ex, requester);
+                if (request_error) {
+                    strong_self->onResult(request_error);
+                    return;
+                }
+
+                DebugL << "status: " << response.status() << ", Location origin: " << safeOriginForLog(response["Location"])
+                       << ", answer bytes: " << response.content().size();
+
+                const auto &request_url = requester->getUrl();
+                if (response.status() == "406" && strong_self->isPlayer()) {
+                    try {
+                        strong_self->assignWhipWhepSessionUrl(request_url, response["Location"]);
+                    } catch (const exception &) {
+                        strong_self->onResult(SockException(Err_other, "invalid WHIP/WHEP session Location"));
+                        return;
+                    }
+                    try {
+                        if (!isSdpContentType(response["Content-Type"])) {
+                            throw invalid_argument("WHEP counter-offer response must use Content-Type: application/sdp");
+                        }
+                        if (response.content().empty()) {
+                            throw invalid_argument("WHEP counter-offer response has an empty SDP body");
+                        }
+                        strong_self->doAnswerWhepCounterOffer(response.content());
+                    } catch (const exception &) {
+                        strong_self->onResult(SockException(Err_other, "invalid WHEP counter-offer response"));
+                    }
+                    return;
+                }
+
+                if (response.status() != "201") {
+                    strong_self->onResult(makeHttpError(response, "WHIP/WHEP negotiation failed"));
+                    return;
+                }
+                try {
+                    strong_self->assignWhipWhepSessionUrl(request_url, response["Location"]);
+                } catch (const exception &) {
+                    strong_self->onResult(SockException(Err_other, "invalid WHIP/WHEP session Location"));
+                    return;
+                }
+                try {
+                    if (!isSdpContentType(response["Content-Type"])) {
+                        throw invalid_argument("WHIP/WHEP 201 response must use Content-Type: application/sdp");
+                    }
+                    if (response.content().empty()) {
+                        throw invalid_argument("WHIP/WHEP 201 response has an empty SDP body");
+                    }
+
+                    strong_self->_transport->setAnswerSdp(response.content());
+                    strong_self->onNegotiateFinish();
+                } catch (const exception &) {
+                    strong_self->onResult(SockException(Err_other, "invalid WHIP/WHEP negotiation response"));
+                }
+            },
+            getTimeOutSec());
+    } catch (...) {
+        onResult(SockException(Err_other, "WHIP/WHEP HTTP request failed"));
+    }
+}
+
+void WebRtcClient::doAnswerWhepCounterOffer(const string &server_offer) {
+    string answer_sdp;
+    try {
+        answer_sdp = _transport->getAnswerSdp(server_offer);
+    } catch (const exception &) {
+        onResult(SockException(Err_other, "invalid WHEP counter-offer"));
+        return;
+    }
+
+    DebugL << "send WHEP counter-offer answer, bytes: " << answer_sdp.size();
+    WhipWhepHttpRequester::Ptr requester;
+    try {
+        requester = makeWhipWhepRequester();
+    } catch (const exception &) {
+        onResult(SockException(Err_other, "invalid WHIP/WHEP requester configuration"));
+        return;
+    }
+    _counter_offer = requester;
+    requester->setMethod("PATCH");
+    requester->setApplicationSdpContentType();
+    requester->setBody(std::move(answer_sdp));
+
+    weak_ptr<WebRtcClient> weak_self = static_pointer_cast<WebRtcClient>(shared_from_this());
+    try {
+        requester->startRequester(
+            _url._delete_url,
+            [weak_self, requester](const toolkit::SockException &ex, const Parser &response) {
+                auto strong_self = weak_self.lock();
+                if (!strong_self) {
+                    return;
+                }
+
+                const auto request_error = strong_self->getWhipWhepRequestError(ex, requester);
+                if (request_error) {
+                    strong_self->onResult(request_error);
+                    return;
+                }
+                if (response.status() != "204") {
+                    strong_self->onResult(makeHttpError(response, "WHEP counter-offer answer was rejected"));
+                    return;
+                }
+                strong_self->onNegotiateFinish();
+            },
+            getTimeOutSec());
+    } catch (...) {
+        onResult(SockException(Err_other, "WHIP/WHEP HTTP request failed"));
+    }
 }
 
 void WebRtcClient::doNegotiateWebsocket() {
@@ -268,28 +504,56 @@ void WebRtcClient::doBye() {
         return;
     }
 
+    _is_negotiate_finished = false;
+
     switch (_url._signaling_protocols) {
-        case WebRtcTransport::SignalingProtocols::WHEP_WHIP: return doByeWhepOrWhip();
-        case WebRtcTransport::SignalingProtocols::WEBSOCKET: return checkOut();
+        case WebRtcTransport::SignalingProtocols::WHEP_WHIP:
+            doByeWhepOrWhip();
+            break;
+        case WebRtcTransport::SignalingProtocols::WEBSOCKET:
+            checkOut();
+            break;
         default: throw std::invalid_argument(StrPrinter << "not support signaling_protocols: " << (int)_url._signaling_protocols);
     }
-    _is_negotiate_finished = false;
 }
 
 void WebRtcClient::doByeWhepOrWhip() {
     DebugL;
-    if (!_negotiate) {
+    if (_url._delete_url.empty()) {
+        WarnL << "WHIP/WHEP session resource URL is empty; skip DELETE";
         return;
     }
-    _negotiate->setMethod("DELETE");
-    _negotiate->setBody("");
-    _negotiate->startRequester(_url._delete_url, [](const toolkit::SockException &ex, const Parser &response) {
-        if (ex) {
-            WarnL << "network err:" << ex;
-            return;
-        }
-        DebugL << "status:" << response.status();
-    }, getTimeOutSec());
+
+    WhipWhepHttpRequester::Ptr requester;
+    try {
+        requester = makeWhipWhepRequester();
+    } catch (const exception &) {
+        WarnL << "invalid WHIP/WHEP requester configuration";
+        return;
+    }
+    _delete_requester = requester;
+    requester->setMethod("DELETE");
+    const auto delete_origin = safeOriginForLog(_url._delete_url);
+    try {
+        requester->startRequester(
+            _url._delete_url,
+            [requester, delete_origin](const toolkit::SockException &ex, const Parser &response) {
+                const auto request_error = WebRtcClient::getWhipWhepRequestError(ex, requester);
+                if (request_error) {
+                    WarnL << "WHIP/WHEP DELETE request failed, error code: " << static_cast<int>(request_error.getErrCode()) << ", origin: " << delete_origin;
+                    return;
+                }
+                if (response.status() != "200") {
+                    WarnL << "WHIP/WHEP DELETE unexpected status: " << response.status() << ", response bytes: " << response.content().size()
+                          << ", origin: " << delete_origin;
+                    return;
+                }
+                DebugL << "WHIP/WHEP DELETE status: " << response.status() << ", origin: " << delete_origin;
+            },
+            getTimeOutSec());
+    } catch (...) {
+        WarnL << "WHIP/WHEP DELETE request start failed, origin: " << delete_origin;
+    }
 }
 
 float WebRtcClient::getTimeOutSec() {

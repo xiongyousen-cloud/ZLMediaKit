@@ -33,6 +33,9 @@ public:
     //// PusherBase override////
     void publish(const std::string &url) override;
     void teardown() override;
+    void setSocketCreator(toolkit::Socket::onCreateSocket cb) override {
+        setWhipWhepSocketCreator(std::move(cb));
+    }
 
     size_t getSendSpeed() override { return getWebRtcTransport() ? getWebRtcTransport()->getSendSpeed() : 0; }
     size_t getSendTotalBytes() override { return getWebRtcTransport() ? getWebRtcTransport()->getSendTotalBytes() : 0; }
@@ -43,6 +46,10 @@ protected:
     bool isPlayer() override { return false; }
     void onResult(const toolkit::SockException &ex) override;
     float getTimeOutSec() override;
+    std::string getWhipWhepCustomHeader() override { return (*this)[Client::kCustomHeader]; }
+    std::string getWhipWhepTrustedOrigins() override { return (*this)[Client::kWhipWhepTrustedOrigins]; }
+    std::string getWhipWhepProxyUrl() override { return (*this)[Client::kProxyUrl]; }
+    std::string getWhipWhepNetAdapter() override { return (*this)[Client::kNetAdapter]; }
 
 protected:
     std::weak_ptr<RtspMediaSource> _push_src;

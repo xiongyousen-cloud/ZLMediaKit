@@ -40,7 +40,7 @@ EventPoller::Ptr WebRtcSession::queryPoller(const Buffer::Ptr &buffer) {
     if (user_name.empty()) {
         return nullptr;
     }
-    auto ret = WebRtcTransportManager::Instance().getItem(user_name);
+    auto ret = WebRtcTransportManager::Instance().getItemByIceUfrag(user_name);
     return ret ? ret->getPoller() : nullptr;
 }
 
@@ -60,7 +60,7 @@ void WebRtcSession::onRecv_l(const char *data, size_t len) {
         // Only allow searching for transport once
         _find_transport = false;
         auto user_name = getUserName(data, len);
-        auto transport = WebRtcTransportManager::Instance().getItem(user_name);
+        auto transport = WebRtcTransportManager::Instance().getItemByIceUfrag(user_name);
         CHECK(transport);
 
         // WebRtcTransport在其他poller线程上，需要切换poller线程并重新创建WebRtcSession对象  [AUTO-TRANSLATED:7e5534cf]

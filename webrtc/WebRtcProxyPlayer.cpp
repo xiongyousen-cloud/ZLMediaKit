@@ -26,6 +26,7 @@ WebRtcProxyPlayer::WebRtcProxyPlayer(const EventPoller::Ptr &poller)
 }
 
 WebRtcProxyPlayer::~WebRtcProxyPlayer(void) {
+    doBye();
     DebugL;
 }
 

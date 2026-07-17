@@ -11,26 +11,30 @@
 #ifndef ZLMEDIAKIT_WEBRTC_CLIENT_H
 #define ZLMEDIAKIT_WEBRTC_CLIENT_H
 
-#include "Http/HttpRequester.h"
+#include "Network/Socket.h"
 #include "Sdp.h"
 #include "WebRtcTransport.h"
 #include "WebRtcSignalingPeer.h"
+#include "WhipWhepHttpRequester.h"
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 
 namespace mediakit {
 
 // 解析webrtc 信令url的工具类
 class WebRTCUrl {
 public:
-    bool _is_ssl;
+    bool _is_ssl = false;
     std::string _full_url;
-    std::string _negotiate_url; // for whep or whip
-    std::string _delete_url; // for whep or whip
+    std::string _negotiate_url; // WHEP/WHIP 协商端点
+    // Location 返回的 WHEP/WHIP 绝对会话资源 URL。
+    std::string _delete_url;
     std::string _target_secret;
     std::string _params;
     std::string _host;
-    uint16_t _port;
+    uint16_t _port = 0;
     std::string _vhost;
     std::string _app;
     std::string _stream;
@@ -63,10 +67,28 @@ protected:
     virtual void onResult(const toolkit::SockException &ex) = 0;
     virtual void onNegotiateFinish();
     virtual float getTimeOutSec();
+    virtual std::string getWhipWhepCustomHeader() { return ""; }
+    virtual std::string getWhipWhepTrustedOrigins() { return ""; }
+    virtual std::string getWhipWhepProxyUrl() { return ""; }
+    virtual std::string getWhipWhepNetAdapter() { return ""; }
+    void setWhipWhepSocketCreator(toolkit::Socket::onCreateSocket cb) {
+        _whip_whep_on_create_socket = std::move(cb);
+    }
+    void prepareWhipWhepSecurityState(const std::string &endpoint_url);
+    virtual WhipWhepHttpRequester::Ptr createWhipWhepRequester();
+    WhipWhepHttpRequester::Ptr makeWhipWhepRequester();
+    std::string validateWhipWhepSessionUrl(const std::string &request_url,
+                                           const std::string &location) const;
+    void assignWhipWhepSessionUrl(const std::string &request_url,
+                                  const std::string &location);
+    static toolkit::SockException getWhipWhepRequestError(
+        const toolkit::SockException &network_error,
+        const WhipWhepHttpRequester::Ptr &requester);
 
     void doNegotiate();
     void doNegotiateWebsocket();
     void doNegotiateWhepOrWhip();
+    void doAnswerWhepCounterOffer(const std::string &server_offer);
     void checkIn();
     void doBye();
     void doByeWhepOrWhip();
@@ -81,9 +103,14 @@ protected:
 
     // for _negotiate_sdp
     WebRTCUrl _url;
-    HttpRequester::Ptr _negotiate = nullptr;
+    WhipWhepHttpRequester::Ptr _negotiate = nullptr;
+    WhipWhepHttpRequester::Ptr _counter_offer = nullptr;
+    WhipWhepHttpRequester::Ptr _delete_requester = nullptr;
     WebRtcSignalingPeer::Ptr _peer = nullptr;
     WebRtcTransport::Ptr _transport = nullptr;
+    std::string _whip_whep_custom_header;
+    std::set<std::string> _whip_whep_trusted_origins;
+    toolkit::Socket::onCreateSocket _whip_whep_on_create_socket;
     bool _is_negotiate_finished = false;
 
 };

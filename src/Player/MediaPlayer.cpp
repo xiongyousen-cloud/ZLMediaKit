@@ -21,25 +21,9 @@ MediaPlayer::MediaPlayer(const EventPoller::Ptr &poller) {
     _poller = poller ? poller : EventPollerPool::Instance().getPoller();
 }
 
-static void setOnCreateSocket_l(const std::shared_ptr<PlayerBase> &delegate, const Socket::onCreateSocket &cb){
-    auto helper = dynamic_pointer_cast<SocketHelper>(delegate);
-    if (helper) {
-        if (cb) {
-            helper->setOnCreateSocket(cb);
-        } else {
-            // 客户端，确保开启互斥锁  [AUTO-TRANSLATED:a75e6e36]
-            // Client, ensure mutual exclusion lock is enabled
-            helper->setOnCreateSocket([](const EventPoller::Ptr &poller) {
-                return Socket::createSocket(poller, true);
-            });
-        }
-    }
-}
-
 void MediaPlayer::play(const string &url) {
     _delegate = PlayerBase::createPlayer(_poller, url, (*this)[Client::kSchema]);
     assert(_delegate);
-    setOnCreateSocket_l(_delegate, _on_create_socket);
     _delegate->setOnShutdown(_on_shutdown);
     _delegate->setOnPlayResult(_on_play_result);
     _delegate->setOnResume(_on_resume);
@@ -47,6 +31,7 @@ void MediaPlayer::play(const string &url) {
     for (auto &pr : *this) {
         (*_delegate)[pr.first] = pr.second;
     }
+    _delegate->setSocketCreator(_on_create_socket);
     _delegate->play(url);
 }
 
@@ -55,8 +40,7 @@ EventPoller::Ptr MediaPlayer::getPoller(){
 }
 
 void MediaPlayer::setOnCreateSocket(Socket::onCreateSocket cb){
-    setOnCreateSocket_l(_delegate, cb);
-    _on_create_socket = std::move(cb);
+    setSocketCreator(std::move(cb));
 }
 
 } /* namespace mediakit */

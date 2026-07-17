@@ -27,7 +27,8 @@ static bool checkMediaSourceAndUrlMatch(const MediaSource::Ptr &src, const std::
     std::string prefix = findSubString(url.data(), NULL, "://");
 
     if (strcasecmp("rtsps", prefix.data()) == 0 || strcasecmp("rtsp", prefix.data()) == 0 ||
-        strcasecmp("webrtcs", prefix.data()) == 0 || strcasecmp("webrtc", prefix.data()) == 0 ) {
+        strcasecmp("webrtcs", prefix.data()) == 0 || strcasecmp("webrtc", prefix.data()) == 0 ||
+        strcasecmp("https", prefix.data()) == 0 || strcasecmp("http", prefix.data()) == 0) {
         auto rtsp_src = std::dynamic_pointer_cast<RtspMediaSource>(src);
         if (!rtsp_src) {
             return false;
@@ -96,7 +97,8 @@ PusherBase::Ptr PusherBase::createPusher(const EventPoller::Ptr &in_poller,
 #endif//ENABLE_SRT
 
 #ifdef ENABLE_WEBRTC
-    if ((strcasecmp("webrtc", prefix.data()) == 0 || strcasecmp("webrtcs", prefix.data()) == 0)) {
+    if (strcasecmp("webrtc", prefix.data()) == 0 || strcasecmp("webrtcs", prefix.data()) == 0 ||
+        strcasecmp("http", prefix.data()) == 0 || strcasecmp("https", prefix.data()) == 0) {
         return PusherBase::Ptr(new WebRtcProxyPusherImp(poller, std::dynamic_pointer_cast<RtspMediaSource>(src)), release_func);
     }
 #endif//ENABLE_WEBRTC
@@ -107,6 +109,14 @@ PusherBase::Ptr PusherBase::createPusher(const EventPoller::Ptr &in_poller,
 PusherBase::PusherBase() {
     this->mINI::operator[](Client::kTimeoutMS) = 10000;
     this->mINI::operator[](Client::kBeatIntervalMS) = 5000;
+}
+
+void PusherBase::setSocketCreator(Socket::onCreateSocket cb) {
+    auto helper = dynamic_cast<SocketHelper *>(this);
+    if (!helper) {
+        return;
+    }
+    helper->setOnCreateSocket(std::move(cb));
 }
 
 } /* namespace mediakit */

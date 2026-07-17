@@ -39,7 +39,6 @@ public:
 private:
     std::weak_ptr<MediaSource> _src;
     toolkit::EventPoller::Ptr _poller;
-    toolkit::Socket::onCreateSocket _on_create_socket;
     std::string _url;
 };
 

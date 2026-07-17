@@ -646,6 +646,7 @@ extern const std::string kLatency;
 extern const std::string kPassPhrase;
 // 自定义rtsp/http头
 extern const std::string kCustomHeader;
+extern const std::string kWhipWhepTrustedOrigins;
 // 指定采用什么播放协议
 extern const std::string kSchema;
 } // namespace Client

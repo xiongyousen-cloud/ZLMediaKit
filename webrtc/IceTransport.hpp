@@ -511,6 +511,10 @@ public:
 
     void gatheringCandidate(const CandidateTuple::Ptr& candidate_tuple, bool gathering_rflx, bool gathering_relay);
     void connectivityCheck(CandidateInfo& candidate);
+    // 添加远端候选；ICE Lite 模式下可不触发主动检查。调用方必须通过代理的 EventPoller 串行调用。
+    bool addRemoteCandidate(const CandidateInfo& candidate, bool run_connectivity_check = true);
+    // 在保留本地套接字的同时替换 ICE 代次；传入候选构成新代次的完整远端候选集合。
+    bool restart(std::string ufrag, std::string password, const std::vector<CandidateInfo>& remote_candidates);
     void nominated(const Pair::Ptr& pair, CandidateTuple& candidate);
 
     void sendSocketData(const toolkit::Buffer::Ptr& buf, const Pair::Ptr& pair, bool flush = true) override;
@@ -596,6 +600,7 @@ protected:
 private:
 
     CandidateInfo getLocalCandidateInfo(const Pair::Ptr& local_pair);
+    void startConnectivityCheck(CandidateInfo& candidate);
     void addToChecklist(const Pair::Ptr& local_pair, CandidateInfo& remote_candidate);
 
 protected:

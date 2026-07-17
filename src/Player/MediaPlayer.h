@@ -30,7 +30,6 @@ public:
 
 private:
     toolkit::EventPoller::Ptr _poller;
-    toolkit::Socket::onCreateSocket _on_create_socket;
 };
 
 } /* namespace mediakit */

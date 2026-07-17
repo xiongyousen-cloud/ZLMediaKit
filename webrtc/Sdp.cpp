@@ -480,6 +480,10 @@ void SdpAttrIceOption::parse(const string &str) {
             trickle = true;
             continue;
         }
+        if (!strcasecmp(v.data(), "ice2")) {
+            ice2 = true;
+            continue;
+        }
         if (!strcasecmp(v.data(), "renomination")) {
             renomination = true;
             continue;
@@ -489,12 +493,20 @@ void SdpAttrIceOption::parse(const string &str) {
 
 string SdpAttrIceOption::toString() const {
     if (value.empty()) {
-        if (trickle && renomination) {
-            value = "trickle renomination";
-        } else if (trickle) {
-            value = "trickle";
-        } else if (renomination) {
-            value = "renomination";
+        const auto append = [this](const char *option) {
+            if (!value.empty()) {
+                value += ' ';
+            }
+            value += option;
+        };
+        if (trickle) {
+            append("trickle");
+        }
+        if (ice2) {
+            append("ice2");
+        }
+        if (renomination) {
+            append("renomination");
         }
     }
     return value;
@@ -802,6 +814,7 @@ void RtcSession::loadFrom(const string &str) {
         rtc_media.bundle_only = media.getItem('a', "bundle-only").operator bool();
         auto ice_options = media.getItemClass<SdpAttrIceOption>('a', "ice-options");
         rtc_media.ice_trickle = ice_options.trickle;
+        rtc_media.ice2 = ice_options.ice2;
         rtc_media.ice_renomination = ice_options.renomination;
         rtc_media.candidate = media.getAllItem<SdpAttrCandidate>('a', "candidate");
 
@@ -814,6 +827,7 @@ void RtcSession::loadFrom(const string &str) {
         rtc_media.direction = media.getDirection();
         rtc_media.extmap = media.getAllItem<SdpAttrExtmap>('a', "extmap");
         rtc_media.rtcp_mux = media.getItem('a', "rtcp-mux").operator bool();
+        rtc_media.rtcp_mux_only = media.getItem('a', "rtcp-mux-only").operator bool();
         rtc_media.rtcp_rsize = media.getItem('a', "rtcp-rsize").operator bool();
 
         map<uint32_t, RtcSSRC> rtc_ssrc_map;
@@ -1113,9 +1127,10 @@ RtcSessionSdp::Ptr RtcSession::toRtcSessionSdp() const {
 
         sdp_media.addAttr(std::make_shared<SdpAttrIceUfrag>(m.ice_ufrag));
         sdp_media.addAttr(std::make_shared<SdpAttrIcePwd>(m.ice_pwd));
-        if (m.ice_trickle || m.ice_renomination) {
+        if (m.ice_trickle || m.ice2 || m.ice_renomination) {
             auto attr = std::make_shared<SdpAttrIceOption>();
             attr->trickle = m.ice_trickle;
+            attr->ice2 = m.ice2;
             attr->renomination = m.ice_renomination;
             sdp_media.addAttr(attr);
         }
@@ -1134,6 +1149,9 @@ RtcSessionSdp::Ptr RtcSession::toRtcSessionSdp() const {
         }
         if (m.rtcp_mux) {
             sdp_media.addAttr(std::make_shared<SdpCommon>("rtcp-mux"));
+        }
+        if (m.rtcp_mux_only) {
+            sdp_media.addAttr(std::make_shared<SdpCommon>("rtcp-mux-only"));
         }
         if (m.rtcp_rsize) {
             sdp_media.addAttr(std::make_shared<SdpCommon>("rtcp-rsize"));
@@ -1442,6 +1460,7 @@ static vector<CodecId> toCodecArray(const string &str) {
 
 void RtcConfigure::RtcTrackConfigure::setDefaultSetting(TrackType type) {
     rtcp_mux = true;
+    rtcp_mux_only = true;
     rtcp_rsize = false;
     group_bundle = true;
     support_rtx = true;
@@ -1449,6 +1468,7 @@ void RtcConfigure::RtcTrackConfigure::setDefaultSetting(TrackType type) {
     support_ulpfec = false;
     ice_lite = true;
     ice_trickle = true;
+    ice2 = true;
     ice_renomination = false;
     switch (type) {
         case TrackAudio: {
@@ -1585,6 +1605,7 @@ shared_ptr<RtcSession> RtcConfigure::createOffer() const {
     ret->origin.session_id = std::to_string(makeRandNum());
     ret->origin.session_version = std::to_string(1);
     ret->session_name = "-";
+    ret->msid_semantic.token = makeUuidStr();
 
     createMediaOffer(ret);
     // 设置音视频端口复用  [AUTO-TRANSLATED:ffe27d17]
@@ -1741,8 +1762,10 @@ void RtcConfigure::createMediaOfferEach(const std::shared_ptr<RtcSession> &ret, 
     // media.bandwidth = ;
     // media.rtcp_addr = ;
     media.rtcp_mux = true;
+    media.rtcp_mux_only = configure.rtcp_mux_only;
     media.rtcp_rsize = true;
-    media.ice_trickle = true;
+    media.ice_trickle = configure.ice_trickle;
+    media.ice2 = configure.ice2;
     media.ice_renomination = configure.ice_renomination;
     media.ice_ufrag = configure.ice_ufrag;
     media.ice_pwd = configure.ice_pwd;
@@ -1812,7 +1835,7 @@ void RtcConfigure::createMediaOfferEach(const std::shared_ptr<RtcSession> &ret, 
         ssrc.ssrc = (uint32_t)makeRandNum();
         ssrc.rtx_ssrc = (uint32_t)makeRandNum();
         ssrc.cname = makeRandStr(16);
-        ssrc.msid = makeRandStr(36) + " " + makeUuidStr();
+        ssrc.msid = ret->msid_semantic.token + " " + makeUuidStr();
         media.rtp_rtx_ssrc.push_back(ssrc);
     }
 
@@ -1887,8 +1910,10 @@ RETRY:
         answer_media.bandwidth = offer_media.bandwidth;
         answer_media.rtcp_addr = offer_media.rtcp_addr;
         answer_media.rtcp_mux = offer_media.rtcp_mux && configure.rtcp_mux;
+        answer_media.rtcp_mux_only = offer_media.rtcp_mux_only && configure.rtcp_mux_only;
         answer_media.rtcp_rsize = offer_media.rtcp_rsize && configure.rtcp_rsize;
         answer_media.ice_trickle = offer_media.ice_trickle && configure.ice_trickle;
+        answer_media.ice2 = offer_media.ice2 && configure.ice2;
         answer_media.ice_renomination = offer_media.ice_renomination && configure.ice_renomination;
         answer_media.ice_ufrag = configure.ice_ufrag;
         answer_media.ice_pwd = configure.ice_pwd;

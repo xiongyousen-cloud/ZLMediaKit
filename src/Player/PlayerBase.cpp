@@ -19,6 +19,7 @@
 #include "../srt/SrtPlayerImp.h"
 #endif // ENABLE_SRT
 #ifdef ENABLE_WEBRTC
+#include "HttpPlayerAutoDetect.h"
 #include "../webrtc/WebRtcProxyPlayerImp.h"
 #endif // ENABLE_WEBRTC
 using namespace std;
@@ -79,6 +80,14 @@ PlayerBase::Ptr PlayerBase::createPlayer(const EventPoller::Ptr &in_poller, cons
         if (end_with(url, ".flv") || end_with(url_in, ".flv") || schema == "flv") {
             return PlayerBase::Ptr(new FlvPlayerImp(poller), release_func);
         }
+#ifdef ENABLE_WEBRTC
+        if (schema == "whep") {
+            return PlayerBase::Ptr(new WebRtcProxyPlayerImp(poller), release_func);
+        }
+        if (schema.empty()) {
+            return PlayerBase::Ptr(new HttpPlayerAutoDetect(poller), release_func);
+        }
+#endif // ENABLE_WEBRTC
     }
 
 #ifdef ENABLE_SRT
@@ -102,6 +111,20 @@ PlayerBase::PlayerBase() {
     this->mINI::operator[](Client::kWaitTrackReady) = true;
     this->mINI::operator[](Client::kLatency) = 0;
     this->mINI::operator[](Client::kPassPhrase) = "";
+}
+
+void PlayerBase::setSocketCreator(Socket::onCreateSocket cb) {
+    auto helper = dynamic_cast<SocketHelper *>(this);
+    if (!helper) {
+        return;
+    }
+    if (cb) {
+        helper->setOnCreateSocket(std::move(cb));
+    } else {
+        helper->setOnCreateSocket([](const EventPoller::Ptr &poller) {
+            return Socket::createSocket(poller, true);
+        });
+    }
 }
 
 } /* namespace mediakit */

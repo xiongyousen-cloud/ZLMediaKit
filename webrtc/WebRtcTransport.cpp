@@ -12,6 +12,8 @@
 #include <functional>
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
+#include <openssl/rand.h>
 #include <srtp2/srtp.h>
 #include "Util/base64.h"
 #include "Network/sockutil.h"
@@ -24,6 +26,7 @@
 #include "Rtsp/Rtsp.h"
 #include "Rtsp/RtpReceiver.h"
 #include "WebRtcTransport.h"
+#include "WhipWhepProtocol.h"
 
 #include "WebRtcEchoTest.h"
 #include "WebRtcPlayer.h"
@@ -260,6 +263,263 @@ static CandidateInfo::Ptr makeCandidateInfoBySdpAttr(const SdpAttrCandidate& can
     return candidate;
 }
 
+static const RtcMedia *findMediaByMid(const RtcSession &sdp, const std::string &mid) {
+    for (const auto &media : sdp.media) {
+        if (media.mid == mid) {
+            return &media;
+        }
+    }
+    return nullptr;
+}
+
+static std::string makeSecureIceCredential(size_t bytes) {
+    std::vector<unsigned char> random(bytes);
+    if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+        throw std::runtime_error("failed to generate secure ICE credentials");
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(random.size() * 2);
+    for (const auto byte : random) {
+        result.push_back(kHex[byte >> 4]);
+        result.push_back(kHex[byte & 0x0F]);
+    }
+    return result;
+}
+
+std::string WebRtcTransport::makeIceRestartCredential(size_t bytes) const {
+    return makeSecureIceCredential(bytes);
+}
+
+bool WebRtcTransport::addWhipWhepRemoteCandidate(const CandidateInfo &candidate) {
+    return _ice_agent && _ice_agent->addRemoteCandidate(candidate, false);
+}
+
+bool WebRtcTransport::restartWhipWhepIceAgent(const std::string &ufrag, const std::string &password,
+                                               const std::vector<CandidateInfo> &remote_candidates) {
+    return _ice_agent && _ice_agent->restart(ufrag, password, remote_candidates);
+}
+
+static bool isBundleGroup(const SdpAttrGroup &group) {
+    return strcasecmp(group.type.c_str(), "BUNDLE") == 0 && !group.mids.empty();
+}
+
+static std::string makeWhipWhepPseudoMediaLine(const RtcMedia &media) {
+    SdpMedia line;
+    line.type = media.type;
+    line.port = media.port;
+    line.proto = media.proto;
+    for (const auto &plan : media.plan) {
+        line.fmts.emplace_back(std::to_string(static_cast<int>(plan.pt)));
+    }
+    if (media.type == TrackApplication) {
+        line.fmts.emplace_back("webrtc-datachannel");
+    }
+    return line.toString();
+}
+
+static bool validateWhipWhepFragmentMids(const WhipWhepSdpFrag &fragment, const RtcSession &offer, const RtcSession &answer) {
+    if (!isBundleGroup(offer.group)) {
+        return false;
+    }
+    const auto &offerer_tag = offer.group.mids.front();
+    if (!fragment.bundle_mids.empty() && fragment.bundle_mids != offer.group.mids) {
+        return false;
+    }
+
+    for (const auto &media : fragment.media) {
+        if (media.mid != offerer_tag || !findMediaByMid(offer, media.mid) || !findMediaByMid(answer, media.mid)) {
+            return false;
+        }
+    }
+    for (const auto &candidate : fragment.candidates) {
+        if (candidate.mid != offerer_tag || !findMediaByMid(offer, candidate.mid) || !findMediaByMid(answer, candidate.mid)) {
+            return false;
+        }
+    }
+    for (const auto &mid : fragment.completed_mids) {
+        if (mid != offerer_tag || !findMediaByMid(offer, mid) || !findMediaByMid(answer, mid)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::set<std::string> getWhipWhepCompletedMids(const WhipWhepSdpFrag &fragment, const RtcSession &offer) {
+    auto result = fragment.completed_mids;
+    if (fragment.end_of_candidates) {
+        for (const auto &media : offer.media) {
+            result.emplace(media.mid);
+        }
+    }
+    return result;
+}
+
+static bool validateWhipWhepFragmentCredentials(const WhipWhepSdpFrag &fragment, const RtcSession &remote_sdp) {
+    if (!fragment.hasIceRestartCredentials()) {
+        return true;
+    }
+
+    bool found_media = false;
+    const auto matches = [&fragment, &remote_sdp, &found_media](const std::string &mid) {
+        const auto media = findMediaByMid(remote_sdp, mid);
+        if (!media || media->ice_ufrag != fragment.ice_ufrag || media->ice_pwd != fragment.ice_pwd) {
+            return false;
+        }
+        found_media = true;
+        return true;
+    };
+
+    for (const auto &candidate : fragment.candidates) {
+        if (!matches(candidate.mid)) {
+            return false;
+        }
+    }
+    for (const auto &mid : fragment.completed_mids) {
+        if (!matches(mid)) {
+            return false;
+        }
+    }
+
+    if (found_media) {
+        return true;
+    }
+    for (const auto &media : remote_sdp.media) {
+        if (media.ice_ufrag == fragment.ice_ufrag && media.ice_pwd == fragment.ice_pwd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool makeWhipWhepCandidateInfo(const WhipWhepIceCandidate &candidate, const std::string &ufrag,
+                                       const std::string &pwd, CandidateInfo::Ptr &result) {
+    static const std::string kCandidatePrefix = "candidate:";
+    result = nullptr;
+    if (candidate.value.compare(0, kCandidatePrefix.size(), kCandidatePrefix) != 0) {
+        return false;
+    }
+
+    SdpAttrCandidate candidate_attr;
+    try {
+        candidate_attr.parse(candidate.value.substr(kCandidatePrefix.size()));
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    // 当前传输仅有一个 RTP/RTCP-mux 分量；RFC 9725 允许静默丢弃实现无法使用的候选。
+    if (candidate_attr.component != 1 || (strcasecmp(candidate_attr.transport.c_str(), "udp") != 0
+        && strcasecmp(candidate_attr.transport.c_str(), "tcp") != 0)) {
+        return true;
+    }
+
+    result = makeCandidateInfoBySdpAttr(candidate_attr, ufrag, pwd);
+    if (result->_type == CandidateInfo::AddressType::INVALID) {
+        result = nullptr;
+    } else if (result->_addr._host.empty() || result->_addr._port == 0) {
+        return false;
+    }
+    return true;
+}
+
+struct WhipWhepRemoteCandidate {
+    std::string mid;
+    CandidateInfo candidate;
+};
+
+static bool makeWhipWhepRemoteCandidates(const WhipWhepSdpFrag &fragment, const RtcSession &remote_sdp,
+                                          const std::string &override_ufrag, const std::string &override_pwd,
+                                          std::vector<WhipWhepRemoteCandidate> &result) {
+    for (const auto &candidate : fragment.candidates) {
+        const auto media = findMediaByMid(remote_sdp, candidate.mid);
+        if (!media) {
+            return false;
+        }
+
+        const auto &ufrag = override_ufrag.empty() ? media->ice_ufrag : override_ufrag;
+        const auto &pwd = override_pwd.empty() ? media->ice_pwd : override_pwd;
+        if (ufrag.empty() || pwd.empty()) {
+            return false;
+        }
+
+        CandidateInfo::Ptr candidate_info;
+        if (!makeWhipWhepCandidateInfo(candidate, ufrag, pwd, candidate_info)) {
+            return false;
+        }
+        if (candidate_info) {
+            result.emplace_back(WhipWhepRemoteCandidate{ candidate.mid, std::move(*candidate_info) });
+        }
+    }
+    return true;
+}
+
+static bool makeWhipWhepLocalFragment(const RtcSession &offer, const RtcSession &local_sdp,
+                                      WhipWhepSdpFrag &fragment) {
+    if (!isBundleGroup(offer.group) || !isBundleGroup(local_sdp.group)) {
+        return false;
+    }
+
+    const auto &offerer_tag = offer.group.mids.front();
+    const auto media = findMediaByMid(local_sdp, offerer_tag);
+    if (!media || media->mid.empty() || media->ice_ufrag.empty() || media->ice_pwd.empty()) {
+        return false;
+    }
+
+    WhipWhepSdpFrag result;
+    result.ice_ufrag = media->ice_ufrag;
+    result.ice_pwd = media->ice_pwd;
+    result.ice_lite = media->ice_lite;
+    result.ice_trickle = media->ice_trickle;
+    result.ice_renomination = media->ice_renomination;
+    if (media->ice_trickle) {
+        result.ice_options.emplace_back("trickle");
+    }
+    if (media->ice2) {
+        result.ice_options.emplace_back("ice2");
+    }
+    if (media->ice_renomination) {
+        result.ice_options.emplace_back("renomination");
+    }
+    result.ice_credentials_at_session_level = false;
+    result.bundle_mids = offer.group.mids;
+    result.media.emplace_back(WhipWhepSdpFragMedia{ media->mid, makeWhipWhepPseudoMediaLine(*media) });
+    for (const auto &candidate : media->candidate) {
+        result.candidates.emplace_back(WhipWhepIceCandidate{ media->mid, "candidate:" + candidate.toString() });
+    }
+    result.completed_mids.emplace(media->mid);
+    fragment.swap(result);
+    return true;
+}
+
+static bool hasSameNegotiatedShape(const RtcSession &current, const RtcSession &staged) {
+    if (current.group.type != staged.group.type || current.group.mids != staged.group.mids
+        || current.media.size() != staged.media.size()) {
+        return false;
+    }
+
+    for (size_t media_index = 0; media_index < current.media.size(); ++media_index) {
+        const auto &current_media = current.media[media_index];
+        const auto &staged_media = staged.media[media_index];
+        if (current_media.mid != staged_media.mid || current_media.type != staged_media.type
+            || current_media.plan.size() != staged_media.plan.size()) {
+            return false;
+        }
+        for (size_t plan_index = 0; plan_index < current_media.plan.size(); ++plan_index) {
+            if (current_media.plan[plan_index].pt != staged_media.plan[plan_index].pt) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void commitIceGeneration(RtcSession &current, RtcSession &staged) noexcept {
+    for (size_t media_index = 0; media_index < current.media.size(); ++media_index) {
+        current.media[media_index].ice_ufrag.swap(staged.media[media_index].ice_ufrag);
+        current.media[media_index].ice_pwd.swap(staged.media[media_index].ice_pwd);
+    }
+}
+
 const char* WebRtcTransport::SignalingProtocolsStr(SignalingProtocols protocol) {
     switch (protocol) {
         case SignalingProtocols::WHEP_WHIP: return "whep_whip";
@@ -295,7 +555,8 @@ void WebRtcTransport::onCreate() {
         }
     }
 
-    _ice_agent = std::make_shared<RTC::IceAgent>(this, implementation, role, _identifier, makeRandStr(24), getPoller());
+    _ice_agent = std::make_shared<RTC::IceAgent>(
+        this, implementation, role, makeSecureIceCredential(12), makeSecureIceCredential(16), getPoller());
     _ice_agent->initialize();
 }
 
@@ -313,7 +574,7 @@ const string &WebRtcTransport::getIdentifier() const {
 
 const std::string &WebRtcTransport::deleteRandStr() const {
     if (_delete_rand_str.empty()) {
-        _delete_rand_str = makeRandStr(32);
+        _delete_rand_str = makeSecureIceCredential(16);
     }
     return _delete_rand_str;
 }
@@ -377,49 +638,318 @@ void WebRtcTransport::connectivityCheckForSFU() {
     DebugL;
     // Connectivity Checks 连通性测试
 
-    auto answer_sdp = answerSdp();
-    // TODO: 暂不支持每个媒体源,RTP,RTCP独立的candidates
-    for (auto &media : answer_sdp->media) {
-        for (auto &item : media.candidate) {
-            auto candidate = makeCandidateInfoBySdpAttr(item, media.ice_ufrag, media.ice_pwd);
-            _ice_agent->gatheringCandidate(candidate, false, false);
-            _ice_agent->connectivityCheck(*candidate);
+    for (auto &candidate : makeRemoteCandidatesForSFU()) {
+        auto candidate_ptr = make_shared<CandidateInfo>(candidate);
+        _ice_agent->gatheringCandidate(candidate_ptr, false, false);
+        _ice_agent->connectivityCheck(candidate);
+    }
+}
+
+vector<CandidateInfo> WebRtcTransport::makeRemoteCandidatesForSFU() const {
+    vector<CandidateInfo> result;
+    // 当前 transport 共享一组 ICE 状态，汇总各 m-line 的候选用于同一次 SFU connectivity check。
+    for (const auto &media : remoteSdp()->media) {
+        for (const auto &item : media.candidate) {
+            result.emplace_back(*makeCandidateInfoBySdpAttr(item, media.ice_ufrag, media.ice_pwd));
         }
     }
+    return result;
+}
+
+const RtcSession::Ptr &WebRtcTransport::localSdp() const {
+    switch (_local_sdp_role) {
+        case LocalSdpRole::Offer:
+            if (_offer_sdp) {
+                return _offer_sdp;
+            }
+            break;
+        case LocalSdpRole::Answer:
+            if (_answer_sdp) {
+                return _answer_sdp;
+            }
+            break;
+        case LocalSdpRole::Unset: break;
+    }
+    throw logic_error("WebRTC SDP ownership is not established");
+}
+
+const RtcSession::Ptr &WebRtcTransport::remoteSdp() const {
+    switch (_local_sdp_role) {
+        case LocalSdpRole::Offer:
+            if (_answer_sdp) {
+                return _answer_sdp;
+            }
+            break;
+        case LocalSdpRole::Answer:
+            if (_offer_sdp) {
+                return _offer_sdp;
+            }
+            break;
+        case LocalSdpRole::Unset: break;
+    }
+    throw logic_error("WebRTC SDP ownership is not established");
+}
+
+const RtcMedia *WebRtcTransport::localMedia(TrackType type) const {
+    return localSdp()->getMedia(type);
+}
+
+const RtcMedia *WebRtcTransport::remoteMedia(TrackType type) const {
+    return remoteSdp()->getMedia(type);
+}
+
+const RtcMedia *WebRtcTransport::localMedia(const string &mid) const {
+    for (const auto &media : localSdp()->media) {
+        if (media.mid == mid) {
+            return &media;
+        }
+    }
+    return nullptr;
+}
+
+const RtcMedia *WebRtcTransport::remoteMedia(const string &mid) const {
+    for (const auto &media : remoteSdp()->media) {
+        if (media.mid == mid) {
+            return &media;
+        }
+    }
+    return nullptr;
+}
+
+bool WebRtcTransport::hasCurrentWhipWhepIceCredentials(const WhipWhepSdpFrag &fragment) {
+    if (!getPoller() || !getPoller()->isCurrentThread() || !_offer_sdp || !_answer_sdp
+        || _signaling_protocols != SignalingProtocols::WHEP_WHIP
+        || !fragment.hasIceRestartCredentials()) {
+        return false;
+    }
+
+    try {
+        return validateWhipWhepFragmentCredentials(fragment, *remoteSdp());
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool WebRtcTransport::applyWhipWhepIceFragment(const WhipWhepSdpFrag &fragment) {
+    if (!getPoller() || !getPoller()->isCurrentThread() || !_ice_agent || !_offer_sdp || !_answer_sdp
+        || _signaling_protocols != SignalingProtocols::WHEP_WHIP
+        || _ice_agent->getImplementation() != IceAgent::Implementation::Lite) {
+        return false;
+    }
+
+    std::vector<WhipWhepRemoteCandidate> candidates;
+    try {
+        const auto &remote_sdp = remoteSdp();
+        if (!validateWhipWhepFragmentMids(fragment, *_offer_sdp, *_answer_sdp)
+            || !validateWhipWhepFragmentCredentials(fragment, *remote_sdp)
+            || !makeWhipWhepRemoteCandidates(fragment, *remote_sdp, "", "", candidates)) {
+            return false;
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    for (const auto &candidate : candidates) {
+        // end-of-candidates 对该 mid 的后续 PATCH 持续生效。ICE 代理没有媒体或 mid 概念，
+        // 因此在传输边界保存此状态。
+        if (!_whip_whep_completed_mids.count(candidate.mid)
+            && !addWhipWhepRemoteCandidate(candidate.candidate)) {
+            return false;
+        }
+    }
+
+    const auto completed_mids = getWhipWhepCompletedMids(fragment, *_offer_sdp);
+    _whip_whep_completed_mids.insert(completed_mids.begin(), completed_mids.end());
+    return true;
+}
+
+bool WebRtcTransport::restartWhipWhepIce(const WhipWhepSdpFrag &remote_fragment, WhipWhepSdpFrag &local_fragment) {
+    if (!getPoller() || !getPoller()->isCurrentThread() || !_ice_agent || !_offer_sdp || !_answer_sdp
+        || _local_sdp_role == LocalSdpRole::Unset
+        || _signaling_protocols != SignalingProtocols::WHEP_WHIP
+        || _ice_agent->getImplementation() != IceAgent::Implementation::Lite
+        || !remote_fragment.hasIceRestartCredentials()
+        || !validateWhipWhepFragmentMids(remote_fragment, *_offer_sdp, *_answer_sdp)) {
+        return false;
+    }
+
+    RtcSession::Ptr next_offer;
+    RtcSession::Ptr next_answer;
+    std::vector<CandidateInfo> remote_candidates;
+    std::set<std::string> next_completed_mids;
+    WhipWhepSdpFrag next_local_fragment;
+    std::string old_ufrag;
+    std::string new_ufrag;
+    std::string new_password;
+    try {
+        old_ufrag = _ice_agent->getUfrag();
+        std::vector<WhipWhepRemoteCandidate> parsed_remote_candidates;
+        if (!makeWhipWhepRemoteCandidates(remote_fragment, *remoteSdp(), remote_fragment.ice_ufrag,
+                                           remote_fragment.ice_pwd, parsed_remote_candidates)) {
+            return false;
+        }
+        remote_candidates.reserve(parsed_remote_candidates.size());
+        for (const auto &candidate : parsed_remote_candidates) {
+            remote_candidates.emplace_back(candidate.candidate);
+        }
+
+        next_offer = std::make_shared<RtcSession>(*_offer_sdp);
+        next_answer = std::make_shared<RtcSession>(*_answer_sdp);
+
+        auto *next_local_sdp = _local_sdp_role == LocalSdpRole::Offer ? next_offer.get() : next_answer.get();
+        auto *next_remote_sdp = _local_sdp_role == LocalSdpRole::Offer ? next_answer.get() : next_offer.get();
+        for (auto &media : next_remote_sdp->media) {
+            media.ice_ufrag = remote_fragment.ice_ufrag;
+            media.ice_pwd = remote_fragment.ice_pwd;
+        }
+
+        for (size_t attempt = 0; attempt < 8 && (new_ufrag.empty() || new_ufrag == old_ufrag); ++attempt) {
+            new_ufrag = makeIceRestartCredential(12);
+        }
+        new_password = makeIceRestartCredential(16);
+        if (new_ufrag.empty() || new_ufrag == old_ufrag || new_password.empty()) {
+            return false;
+        }
+
+        for (auto &media : next_local_sdp->media) {
+            media.ice_ufrag = new_ufrag;
+            media.ice_pwd = new_password;
+        }
+
+        next_completed_mids = getWhipWhepCompletedMids(remote_fragment, *next_offer);
+        if (!hasSameNegotiatedShape(*_offer_sdp, *next_offer)
+            || !hasSameNegotiatedShape(*_answer_sdp, *next_answer)
+            || !makeWhipWhepLocalFragment(*next_offer, *next_local_sdp, next_local_fragment)) {
+            return false;
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    if (!prepareIceUfragChange(old_ufrag, new_ufrag)) {
+        return false;
+    }
+    bool agent_restarted = false;
+    try {
+        agent_restarted = restartWhipWhepIceAgent(new_ufrag, new_password, remote_candidates);
+    } catch (const std::exception &) {
+        agent_restarted = false;
+    }
+    if (!agent_restarted) {
+        rollbackIceUfragChange(old_ufrag, new_ufrag);
+        return false;
+    }
+
+    // 从这里开始只执行 noexcept 交换：活跃 MediaTrack 保存的 RtcMedia/RtcCodecPlan
+    // 地址保持不变，且不会在 ICE 代理已经切代后留下半提交 SDP。
+    commitIceUfragChange(old_ufrag, new_ufrag);
+    commitIceGeneration(*_offer_sdp, *next_offer);
+    commitIceGeneration(*_answer_sdp, *next_answer);
+    _whip_whep_completed_mids.swap(next_completed_mids);
+    local_fragment.swap(next_local_fragment);
+    return true;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+RtpDirection WebRtcTransport::directionForAnswerMedia(const RtcMedia &answer_media, LocalSdpRole local_role) const {
+    if (local_role == LocalSdpRole::Answer) {
+        switch (answer_media.direction) {
+            case RtpDirection::sendonly:
+            case RtpDirection::recvonly:
+            case RtpDirection::sendrecv:
+            case RtpDirection::inactive: return answer_media.direction;
+            case RtpDirection::invalid: break;
+        }
+    } else if (local_role == LocalSdpRole::Offer) {
+        switch (answer_media.direction) {
+            case RtpDirection::sendonly: return RtpDirection::recvonly;
+            case RtpDirection::recvonly: return RtpDirection::sendonly;
+            case RtpDirection::sendrecv: return RtpDirection::sendrecv;
+            case RtpDirection::inactive: return RtpDirection::inactive;
+            case RtpDirection::invalid: break;
+        }
+    } else {
+        throw logic_error("WebRTC SDP ownership is not established");
+    }
+    throw logic_error("WebRTC answer media direction is invalid");
+}
+
+RtpDirection WebRtcTransport::localDirectionForAnswerMedia(const RtcMedia &answer_media) const {
+    return directionForAnswerMedia(answer_media, _local_sdp_role);
+}
+
+WebRtcTransport::LocalSdpRole WebRtcTransport::answerCheckLocalSdpRole() const {
+    return _answer_check_local_sdp_role == LocalSdpRole::Unset
+        ? _local_sdp_role
+        : _answer_check_local_sdp_role;
+}
+
+DtlsRole WebRtcTransport::localDtlsRole() const {
+    if (_local_sdp_role == LocalSdpRole::Unset || !_answer_sdp) {
+        throw logic_error("WebRTC SDP ownership is not established");
+    }
+    if (_answer_sdp->media.empty()) {
+        throw logic_error("WebRTC answer SDP has no media");
+    }
+
+    const auto answer_role = _answer_sdp->media[0].role;
+    if (_local_sdp_role == LocalSdpRole::Answer) {
+        if (answer_role == DtlsRole::active || answer_role == DtlsRole::passive) {
+            return answer_role;
+        }
+    } else if (_local_sdp_role == LocalSdpRole::Offer) {
+        if (answer_role == DtlsRole::active) {
+            return DtlsRole::passive;
+        }
+        if (answer_role == DtlsRole::passive) {
+            return DtlsRole::active;
+        }
+    }
+    throw logic_error("WebRTC answer DTLS role is not final");
+}
+
+const RTC::DtlsTransport::Fingerprint &WebRtcTransport::remoteDtlsFingerprint() const {
+    if (!_dtls_transport) {
+        throw logic_error("WebRTC DTLS transport is not initialized");
+    }
+    return _dtls_transport->GetRemoteFingerprint();
+}
+
 void WebRtcTransport::onIceTransportCompleted() {
     InfoL << getIdentifier();
 
-    if (!_answer_sdp) {
-        onShutdown(SockException(Err_other, "answer sdp not ready"));
+    DtlsRole dtls_role;
+    try {
+        dtls_role = localDtlsRole();
+    } catch (const exception &ex) {
+        onShutdown(SockException(Err_other, ex.what()));
         return;
     }
 
     _recv_ticker.resetTime();
     auto timeout = getTimeOutSec();
     weak_ptr<WebRtcTransport> weakSelf = static_pointer_cast<WebRtcTransport>(shared_from_this());
-    _check_timer = std::make_shared<Timer>(timeout / 2, [weakSelf, timeout]() {
-        auto strongSelf = weakSelf.lock();
-        if (!strongSelf) {
-            return false;
-        }
-        if (strongSelf->_recv_ticker.elapsedTime() > timeout * 1000) {
-            // 接收媒体数据包超时
-            strongSelf->onShutdown(SockException(Err_timeout, "webrtc data receive timeout"));
-            return false;
-        }
+    if (!_check_timer) {
+        _check_timer = std::make_shared<Timer>(timeout / 2, [weakSelf, timeout]() {
+            auto strongSelf = weakSelf.lock();
+            if (!strongSelf) {
+                return false;
+            }
+            if (strongSelf->_recv_ticker.elapsedTime() > timeout * 1000) {
+                // 接收媒体数据包超时
+                strongSelf->onShutdown(SockException(Err_timeout, "webrtc data receive timeout"));
+                return false;
+            }
 
-        return true;
-    }, getPoller());
+            return true;
+        }, getPoller());
+    }
 
-    if ((getRole() == Role::PEER && _answer_sdp->media[0].role == DtlsRole::passive)
-        || (getRole() == Role::CLIENT && _answer_sdp->media[0].role == DtlsRole::active)) {
-        _dtls_transport->Run(RTC::DtlsTransport::Role::SERVER);
-    } else {
+    if (dtls_role == DtlsRole::active) {
         _dtls_transport->Run(RTC::DtlsTransport::Role::CLIENT);
+    } else {
+        _dtls_transport->Run(RTC::DtlsTransport::Role::SERVER);
     }
 }
 
@@ -648,7 +1178,13 @@ string getFingerprint(const string &algorithm_str, const std::shared_ptr<RTC::Dt
 void WebRtcTransport::setRemoteDtlsFingerprint(SdpType type, const RtcSession &remote) {
     // 设置远端dtls签名  [AUTO-TRANSLATED:746d5f9c]
     // Set remote dtls signature
-    auto &media = (type == SdpType::answer) ? _answer_sdp->media[0] : _offer_sdp->media[0];
+    if (type != SdpType::offer && type != SdpType::answer) {
+        throw invalid_argument("invalid remote SDP type");
+    }
+    if (remote.media.empty()) {
+        throw invalid_argument("remote SDP has no media");
+    }
+    const auto &media = remote.media[0];
     RTC::DtlsTransport::Fingerprint remote_fingerprint;
     remote_fingerprint.algorithm = RTC::DtlsTransport::GetFingerprintAlgorithm(media.fingerprint.algorithm);
     remote_fingerprint.value = media.fingerprint.hash;
@@ -685,23 +1221,34 @@ std::string WebRtcTransport::createOfferSdp() {
     try {
         RtcConfigure configure;
         onRtcConfigure(configure);
-        _offer_sdp = configure.createOffer();
-        return _offer_sdp->toString();
-    } catch (exception &ex) {
+        auto next_offer = configure.createOffer();
+        next_offer->checkValid();
+        auto result = next_offer->toString();
+
+        _offer_sdp = std::move(next_offer);
+        _answer_sdp.reset();
+        _local_sdp_role = LocalSdpRole::Offer;
+        return result;
+    } catch (const exception &ex) {
         onShutdown(SockException(Err_shutdown, ex.what()));
         throw;
     }
 }
 
 std::string WebRtcTransport::getAnswerSdp(const string &offer) {
+    const auto previous_offer = _offer_sdp;
+    const auto previous_answer = _answer_sdp;
+    const auto previous_local_role = _local_sdp_role;
     try {
         // // 解析offer sdp ////  [AUTO-TRANSLATED:87c1f337]
         // // Parse offer sdp ////
-        _offer_sdp = std::make_shared<RtcSession>();
-        _offer_sdp->loadFrom(offer);
-        onCheckSdp(SdpType::offer, *_offer_sdp);
-        _offer_sdp->checkValid();
-        setRemoteDtlsFingerprint(SdpType::offer, *_offer_sdp);
+        auto staged_offer = make_shared<RtcSession>();
+        staged_offer->loadFrom(offer);
+        _offer_sdp = staged_offer;
+        _answer_sdp.reset();
+        _local_sdp_role = LocalSdpRole::Unset;
+        onCheckSdp(SdpType::offer, *staged_offer);
+        staged_offer->checkValid();
 
         // // sdp 配置 ////  [AUTO-TRANSLATED:718a72e2]
         // // sdp configuration ////
@@ -710,25 +1257,43 @@ std::string WebRtcTransport::getAnswerSdp(const string &offer) {
 
         // // 生成answer sdp ////  [AUTO-TRANSLATED:a139475e]
         // // Generate answer sdp ////
-        _answer_sdp = configure.createAnswer(*_offer_sdp);
-        onCheckSdp(SdpType::answer, *_answer_sdp);
-        setSdpBitrate(*_answer_sdp);
-        _answer_sdp->checkValid();
-        return _answer_sdp->toString();
-    } catch (exception &ex) {
+        auto next_answer = configure.createAnswer(*staged_offer);
+        _answer_check_local_sdp_role = LocalSdpRole::Answer;
+        onCheckSdp(SdpType::answer, *next_answer);
+        _answer_check_local_sdp_role = LocalSdpRole::Unset;
+        setSdpBitrate(*next_answer);
+        next_answer->checkValid();
+        auto result = next_answer->toString();
+        setRemoteDtlsFingerprint(SdpType::offer, *staged_offer);
+        _answer_sdp = std::move(next_answer);
+        _local_sdp_role = LocalSdpRole::Answer;
+        return result;
+    } catch (const exception &ex) {
+        _answer_check_local_sdp_role = LocalSdpRole::Unset;
+        _offer_sdp = previous_offer;
+        _answer_sdp = previous_answer;
+        _local_sdp_role = previous_local_role;
         onShutdown(SockException(Err_shutdown, ex.what()));
         throw;
     }
 }
 
 void WebRtcTransport::setAnswerSdp(const std::string &answer) {
+    const auto previous_answer = _answer_sdp;
+    const auto previous_local_role = _local_sdp_role;
     try {
-        _answer_sdp = std::make_shared<RtcSession>();
-        _answer_sdp->loadFrom(answer);
-        onCheckSdp(SdpType::answer, *_answer_sdp);
-        _answer_sdp->checkValid();
-        setRemoteDtlsFingerprint(SdpType::answer, *_answer_sdp);
-    } catch (exception &ex) {
+        if (_local_sdp_role != LocalSdpRole::Offer || !_offer_sdp) {
+            throw logic_error("remote answer requires a local WebRTC offer");
+        }
+        auto next_answer = make_shared<RtcSession>();
+        next_answer->loadFrom(answer);
+        onCheckSdp(SdpType::answer, *next_answer);
+        next_answer->checkValid();
+        setRemoteDtlsFingerprint(SdpType::answer, *next_answer);
+        _answer_sdp = std::move(next_answer);
+    } catch (const exception &ex) {
+        _answer_sdp = previous_answer;
+        _local_sdp_role = previous_local_role;
         onShutdown(SockException(Err_shutdown, ex.what()));
         throw;
     }
@@ -865,19 +1430,20 @@ void WebRtcTransportImp::onSendSockData(Buffer::Ptr buf, bool flush, const IceTr
 
 ///////////////////////////////////////////////////////////////////
 bool WebRtcTransportImp::canSendRtp(const RtcMedia& m) const {
-    return (getRole() == WebRtcTransport::Role::PEER && m.direction == RtpDirection::sendonly)
-            || (getRole() == WebRtcTransport::Role::CLIENT && m.direction == RtpDirection::recvonly)
-            || (m.direction == RtpDirection::sendrecv);
+    const auto direction = localDirectionForAnswerMedia(m);
+    return direction == RtpDirection::sendonly || direction == RtpDirection::sendrecv;
 }
 
 bool WebRtcTransportImp::canRecvRtp(const RtcMedia& m) const {
-    return (getRole() == WebRtcTransport::Role::PEER && m.direction == RtpDirection::recvonly)
-            || (getRole() == WebRtcTransport::Role::CLIENT && m.direction == RtpDirection::sendonly)
-            || (m.direction == RtpDirection::sendrecv);
+    const auto direction = localDirectionForAnswerMedia(m);
+    return direction == RtpDirection::recvonly || direction == RtpDirection::sendrecv;
 }
 
 bool WebRtcTransportImp::canSendRtp() const {
     for (auto &m : _answer_sdp->media) {
+        if (m.type == TrackApplication) {
+            continue;
+        }
         if (canSendRtp(m)) {
             return true;
         }
@@ -887,6 +1453,9 @@ bool WebRtcTransportImp::canSendRtp() const {
 
 bool WebRtcTransportImp::canRecvRtp() const {
     for (auto &m : _answer_sdp->media) {
+        if (m.type == TrackApplication) {
+            continue;
+        }
         if (canRecvRtp(m)) {
             return true;
         }
@@ -997,7 +1566,19 @@ void WebRtcTransportImp::onCheckAnswer(RtcSession &sdp) {
         sdp.origin.address = m.addr.address;
     }
 
-    if (!canSendRtp()) {
+    bool can_send_rtp = false;
+    const auto local_role = answerCheckLocalSdpRole();
+    for (const auto &media : sdp.media) {
+        if (media.type == TrackApplication) {
+            continue;
+        }
+        const auto direction = directionForAnswerMedia(media, local_role);
+        if (direction == RtpDirection::sendonly || direction == RtpDirection::sendrecv) {
+            can_send_rtp = true;
+            break;
+        }
+    }
+    if (!can_send_rtp) {
         // 设置我们发送的rtp的ssrc  [AUTO-TRANSLATED:3704484a]
         // Set the ssrc of the rtp we send
         return;
@@ -1103,6 +1684,41 @@ void WebRtcTransportImp::setLocalIp(std::string local_ip) {
 
 void WebRtcTransportImp::setIceCandidate(vector<SdpAttrCandidate> cands) {
     _cands = std::move(cands);
+}
+
+const MediaTrack *WebRtcTransportImp::mediaTrack(TrackType type) const {
+    if (type != TrackAudio && type != TrackVideo) {
+        return nullptr;
+    }
+    return _type_to_track[type].get();
+}
+
+bool WebRtcTransportImp::prepareIceUfragChange(const std::string &old_ufrag, const std::string &new_ufrag) {
+    if (!_self || old_ufrag.empty() || new_ufrag.empty()) {
+        return false;
+    }
+    std::string next_ufrag_buffer;
+    try {
+        next_ufrag_buffer = new_ufrag;
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (!WebRtcTransportManager::Instance().prepareIceUfragChange(old_ufrag, new_ufrag, _self)) {
+        return false;
+    }
+    _ice_ufrag_change_buffer.swap(next_ufrag_buffer);
+    return true;
+}
+
+void WebRtcTransportImp::commitIceUfragChange(const std::string &old_ufrag,
+                                               const std::string &new_ufrag) noexcept {
+    WebRtcTransportManager::Instance().commitIceUfragChange(old_ufrag, new_ufrag, this);
+    _registered_ice_ufrag.swap(_ice_ufrag_change_buffer);
+}
+
+void WebRtcTransportImp::rollbackIceUfragChange(const std::string &old_ufrag,
+                                                 const std::string &new_ufrag) noexcept {
+    WebRtcTransportManager::Instance().rollbackIceUfragChange(old_ufrag, new_ufrag, this);
 }
 
 ///////////////////////////////////////////////////////////////////
@@ -1589,8 +2205,13 @@ void WebRtcTransportImp::onRtcpBye(){}
 /////////////////////////////////////////////////////////////////////////////////////////////
 
 void WebRtcTransportImp::registerSelf() {
-    _self = static_pointer_cast<WebRtcTransportImp>(shared_from_this());
-    WebRtcTransportManager::Instance().addItem(getIdentifier(), _self);
+    auto self = static_pointer_cast<WebRtcTransportImp>(shared_from_this());
+    std::string registered_ice_ufrag = _ice_agent ? _ice_agent->getUfrag() : "";
+    if (!WebRtcTransportManager::Instance().addItem(getIdentifier(), registered_ice_ufrag, self)) {
+        throw std::runtime_error("failed to register WebRTC transport");
+    }
+    _self = std::move(self);
+    _registered_ice_ufrag.swap(registered_ice_ufrag);
 }
 
 void WebRtcTransportImp::unrefSelf() {
@@ -1599,8 +2220,9 @@ void WebRtcTransportImp::unrefSelf() {
 
 void WebRtcTransportImp::unregisterSelf() {
     DebugL;
+    WebRtcTransportManager::Instance().removeItem(
+        getIdentifier(), _registered_ice_ufrag, _ice_ufrag_change_buffer, this);
     unrefSelf();
-    WebRtcTransportManager::Instance().removeItem(getIdentifier());
 }
 
 WebRtcTransportManager &WebRtcTransportManager::Instance() {
@@ -1608,9 +2230,64 @@ WebRtcTransportManager &WebRtcTransportManager::Instance() {
     return s_instance;
 }
 
-void WebRtcTransportManager::addItem(const string &key, const WebRtcTransportImp::Ptr &ptr) {
+bool WebRtcTransportManager::addItem(const string &key, const string &ice_ufrag,
+                                     const WebRtcTransportImp::Ptr &ptr) {
+    if (key.empty() || !ptr) {
+        return false;
+    }
+
     lock_guard<mutex> lck(_mtx);
-    _map[key] = ptr;
+    bool has_key = false;
+    auto key_it = _map.find(key);
+    if (key_it != _map.end()) {
+        const auto existing = key_it->second.lock();
+        if (existing && existing != ptr) {
+            return false;
+        }
+        if (existing) {
+            has_key = true;
+        } else {
+            _map.erase(key_it);
+        }
+    }
+
+    bool has_ice_ufrag = ice_ufrag.empty();
+    if (!ice_ufrag.empty()) {
+        auto ufrag_it = _ice_ufrag_map.find(ice_ufrag);
+        if (ufrag_it != _ice_ufrag_map.end()) {
+            const auto existing = ufrag_it->second.lock();
+            if (existing && existing != ptr) {
+                return false;
+            }
+            if (existing) {
+                has_ice_ufrag = true;
+            } else {
+                _ice_ufrag_map.erase(ufrag_it);
+            }
+        }
+    }
+
+    bool inserted_key = false;
+    try {
+        if (!has_key) {
+            inserted_key = _map.emplace(key, ptr).second;
+            if (!inserted_key) {
+                return false;
+            }
+        }
+        if (!has_ice_ufrag && !_ice_ufrag_map.emplace(ice_ufrag, ptr).second) {
+            if (inserted_key) {
+                _map.erase(key);
+            }
+            return false;
+        }
+    } catch (const std::exception &) {
+        if (inserted_key) {
+            _map.erase(key);
+        }
+        return false;
+    }
+    return true;
 }
 
 WebRtcTransportImp::Ptr WebRtcTransportManager::getItem(const string &key) {
@@ -1625,9 +2302,109 @@ WebRtcTransportImp::Ptr WebRtcTransportManager::getItem(const string &key) {
     return it->second.lock();
 }
 
-void WebRtcTransportManager::removeItem(const string &key) {
+WebRtcTransportImp::Ptr WebRtcTransportManager::getItemByIceUfrag(const string &ufrag) {
+    if (ufrag.empty()) {
+        return nullptr;
+    }
     lock_guard<mutex> lck(_mtx);
-    _map.erase(key);
+    auto it = _ice_ufrag_map.find(ufrag);
+    if (it == _ice_ufrag_map.end()) {
+        return nullptr;
+    }
+    return it->second.lock();
+}
+
+void WebRtcTransportManager::removeItem(const string &key, const string &ice_ufrag,
+                                        const string &buffered_ufrag, const WebRtcTransportImp *ptr) {
+    lock_guard<mutex> lck(_mtx);
+    const auto key_it = _map.find(key);
+    if (key_it != _map.end()) {
+        const auto existing = key_it->second.lock();
+        if (!existing || existing.get() == ptr) {
+            _map.erase(key_it);
+        }
+    }
+
+    const auto remove_ufrag = [this, ptr](const string &ufrag) {
+        if (ufrag.empty()) {
+            return;
+        }
+        const auto it = _ice_ufrag_map.find(ufrag);
+        if (it == _ice_ufrag_map.end()) {
+            return;
+        }
+        const auto existing = it->second.lock();
+        if (!existing || existing.get() == ptr) {
+            _ice_ufrag_map.erase(it);
+        }
+    };
+    remove_ufrag(ice_ufrag);
+    if (buffered_ufrag != ice_ufrag) {
+        remove_ufrag(buffered_ufrag);
+    }
+}
+
+bool WebRtcTransportManager::prepareIceUfragChange(const string &old_ufrag, const string &new_ufrag,
+                                                   const WebRtcTransportImp::Ptr &ptr) {
+    if (old_ufrag.empty() || new_ufrag.empty() || old_ufrag == new_ufrag || !ptr) {
+        return false;
+    }
+
+    lock_guard<mutex> lck(_mtx);
+    const auto old_it = _ice_ufrag_map.find(old_ufrag);
+    if (old_it == _ice_ufrag_map.end() || old_it->second.lock() != ptr) {
+        return false;
+    }
+    const auto new_it = _ice_ufrag_map.find(new_ufrag);
+    if (new_it != _ice_ufrag_map.end()) {
+        const auto existing = new_it->second.lock();
+        if (existing && existing != ptr) {
+            return false;
+        }
+        if (existing == ptr) {
+            return true;
+        }
+        _ice_ufrag_map.erase(new_it);
+    }
+
+    try {
+        if (!_ice_ufrag_map.emplace(new_ufrag, ptr).second) {
+            return false;
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
+}
+
+void WebRtcTransportManager::commitIceUfragChange(const string &old_ufrag, const string &new_ufrag,
+                                                   const WebRtcTransportImp *ptr) noexcept {
+    lock_guard<mutex> lck(_mtx);
+    const auto old_it = _ice_ufrag_map.find(old_ufrag);
+    const auto new_it = _ice_ufrag_map.find(new_ufrag);
+    if (old_it == _ice_ufrag_map.end() || new_it == _ice_ufrag_map.end()) {
+        return;
+    }
+    const auto old_owner = old_it->second.lock();
+    const auto new_owner = new_it->second.lock();
+    if (old_owner.get() == ptr && new_owner.get() == ptr) {
+        _ice_ufrag_map.erase(old_it);
+    }
+}
+
+void WebRtcTransportManager::rollbackIceUfragChange(const string &old_ufrag, const string &new_ufrag,
+                                                     const WebRtcTransportImp *ptr) noexcept {
+    lock_guard<mutex> lck(_mtx);
+    const auto old_it = _ice_ufrag_map.find(old_ufrag);
+    const auto new_it = _ice_ufrag_map.find(new_ufrag);
+    if (old_it == _ice_ufrag_map.end() || new_it == _ice_ufrag_map.end()) {
+        return;
+    }
+    const auto old_owner = old_it->second.lock();
+    const auto new_owner = new_it->second.lock();
+    if (old_owner.get() == ptr && new_owner.get() == ptr) {
+        _ice_ufrag_map.erase(new_it);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////
