@@ -124,6 +124,15 @@ class WebRtcWhipWhepIceTransport final : public WhipWhepIceTransport {
 public:
     explicit WebRtcWhipWhepIceTransport(const WebRtcTransportImp::Ptr &transport) : _transport(transport) {}
 
+    bool async(Task task) override {
+        auto transport = _transport.lock();
+        if (!transport) {
+            return false;
+        }
+        auto task_holder = make_shared<Task>(std::move(task));
+        return !!transport->getPoller()->async([transport, task_holder]() { (*task_holder)(); }, false);
+    }
+
     bool hasCurrentIceCredentials(const WhipWhepSdpFrag &fragment) override {
         return invoke([&](WebRtcTransport &transport) {
             return transport.hasCurrentWhipWhepIceCredentials(fragment);
@@ -152,15 +161,12 @@ private:
         if (!transport) {
             return false;
         }
-
-        bool result = false;
         try {
-            transport->getPoller()->sync([&]() { result = func(*transport); });
+            return func(*transport);
         } catch (const exception &ex) {
             WarnL << "WHIP/WHEP ICE operation failed: " << ex.what();
             return false;
         }
-        return result;
     }
 
 private:
@@ -450,38 +456,50 @@ void handleWhipWhepResource(bool whep,
         return;
     }
 
-    WhipWhepPatchResult result;
+    WhipWhepSdpFrag fragment;
     try {
-        result = resource->session->applyPatch(WhipWhepSdpFrag::parse(parser.content()), parser["If-Match"]);
+        fragment = WhipWhepSdpFrag::parse(parser.content());
     } catch (const exception &ex) {
         respondWhipWhepError(parser, invoker, 400, ex.what());
         return;
     }
 
-    HttpSession::KeyValue header;
-    switch (result.status) {
-        case WhipWhepPatchStatus::Applied:
-            respondWhipWhep(parser, invoker, 204, std::move(header));
-            return;
-        case WhipWhepPatchStatus::Restarted:
-            header.emplace("Content-Type", "application/trickle-ice-sdpfrag");
-            header.emplace("ETag", result.etag);
-            respondWhipWhep(parser, invoker, 200, std::move(header), result.response_fragment.toString());
-            return;
-        case WhipWhepPatchStatus::PreconditionRequired:
-            respondWhipWhepError(parser, invoker, 428, "If-Match is required for a trickle ICE PATCH");
-            return;
-        case WhipWhepPatchStatus::PreconditionFailed:
-            respondWhipWhepError(parser, invoker, 412, "WHIP/WHEP If-Match precondition failed");
-            return;
-        case WhipWhepPatchStatus::Unsupported:
-            respondWhipWhepError(parser, invoker, 422, "WHIP/WHEP ICE update is not supported by this transport");
-            return;
-        case WhipWhepPatchStatus::Closed:
-            removeWhipWhepResource(resource_id);
-            respondWhipWhepError(parser, invoker, 410, "WHIP/WHEP resource is closed");
-            return;
-    }
+    resource->session->applyPatchAsync(fragment, parser["If-Match"],
+        [resource_id, parser, invoker](WhipWhepPatchResult result, exception_ptr error) mutable {
+            if (error) {
+                try {
+                    rethrow_exception(error);
+                } catch (const exception &ex) {
+                    respondWhipWhepError(parser, invoker, 400, ex.what());
+                    return;
+                }
+            }
+
+            HttpSession::KeyValue header;
+            switch (result.status) {
+                case WhipWhepPatchStatus::Applied:
+                    respondWhipWhep(parser, invoker, 204, std::move(header));
+                    return;
+                case WhipWhepPatchStatus::Restarted:
+                    header.emplace("Content-Type", "application/trickle-ice-sdpfrag");
+                    header.emplace("ETag", result.etag);
+                    respondWhipWhep(parser, invoker, 200, std::move(header), result.response_fragment.toString());
+                    return;
+                case WhipWhepPatchStatus::PreconditionRequired:
+                    respondWhipWhepError(parser, invoker, 428, "If-Match is required for a trickle ICE PATCH");
+                    return;
+                case WhipWhepPatchStatus::PreconditionFailed:
+                    respondWhipWhepError(parser, invoker, 412, "WHIP/WHEP If-Match precondition failed");
+                    return;
+                case WhipWhepPatchStatus::Unsupported:
+                    respondWhipWhepError(parser, invoker, 422, "WHIP/WHEP ICE update is not supported by this transport");
+                    return;
+                case WhipWhepPatchStatus::Closed:
+                    removeWhipWhepResource(resource_id);
+                    respondWhipWhepError(parser, invoker, 410, "WHIP/WHEP resource is closed");
+                    return;
+            }
+        });
 }
 
 void handleWhipWhepHttpRequest(const Parser &parser,

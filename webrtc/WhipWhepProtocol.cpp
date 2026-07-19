@@ -775,6 +775,40 @@ WhipWhepSession::WhipWhepSession(string etag, shared_ptr<WhipWhepIceTransport> t
     }
 }
 
+void WhipWhepSession::applyPatchAsync(const WhipWhepSdpFrag &fragment,
+                                      const string &if_match,
+                                      PatchCallback callback) {
+    if (!callback) {
+        throw invalid_argument("WHIP/WHEP PATCH requires a completion callback");
+    }
+
+    auto self = shared_from_this();
+    auto completion = make_shared<PatchCallback>(std::move(callback));
+    auto task = [self, fragment, if_match, completion]() {
+        WhipWhepPatchResult result;
+        exception_ptr error;
+        try {
+            result = self->applyPatch(fragment, if_match);
+        } catch (...) {
+            error = current_exception();
+        }
+        (*completion)(std::move(result), std::move(error));
+    };
+
+    exception_ptr dispatch_error;
+    bool dispatched = false;
+    try {
+        dispatched = _transport->async(std::move(task));
+    } catch (...) {
+        dispatch_error = current_exception();
+    }
+    if (!dispatched) {
+        WhipWhepPatchResult result;
+        result.status = WhipWhepPatchStatus::Closed;
+        (*completion)(std::move(result), std::move(dispatch_error));
+    }
+}
+
 WhipWhepPatchResult WhipWhepSession::applyPatch(const WhipWhepSdpFrag &fragment, const string &if_match) {
     lock_guard<mutex> lock(_mtx);
     WhipWhepPatchResult result;

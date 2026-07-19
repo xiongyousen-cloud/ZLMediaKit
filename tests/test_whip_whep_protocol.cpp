@@ -9,11 +9,14 @@
  */
 
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "../webrtc/WhipWhepHttpRequester.h"
 #include "../webrtc/WhipWhepProtocol.h"
@@ -394,7 +397,14 @@ void testWhipWhepSessionLocationResolution() {
 
 class FakeIceTransport : public WhipWhepIceTransport {
 public:
+    bool async(function<void()> task) override {
+        ++async_calls;
+        pending_tasks.emplace_back(std::move(task));
+        return true;
+    }
+
     bool hasCurrentIceCredentials(const WhipWhepSdpFrag &fragment) override {
+        ++credential_check_calls;
         return fragment.ice_ufrag == current_remote_ufrag && fragment.ice_pwd == current_remote_pwd;
     }
 
@@ -422,8 +432,18 @@ public:
         ++close_calls;
     }
 
+    void runPendingTasks() {
+        auto tasks = std::move(pending_tasks);
+        pending_tasks.clear();
+        for (auto &task : tasks) {
+            task();
+        }
+    }
+
     bool apply_candidates_result = true;
     bool restart_result = true;
+    size_t async_calls = 0;
+    size_t credential_check_calls = 0;
     size_t apply_candidates_calls = 0;
     size_t restart_calls = 0;
     size_t close_calls = 0;
@@ -431,6 +451,7 @@ public:
     string current_remote_pwd = "currentRemotePassword123456";
     WhipWhepSdpFrag last_candidates;
     WhipWhepSdpFrag last_remote_fragment;
+    vector<function<void()>> pending_tasks;
 };
 
 WhipWhepSdpFrag makeCandidatePatch() {
@@ -452,40 +473,95 @@ WhipWhepSdpFrag makeRestartPatch() {
         "a=candidate:2 1 udp 2122260223 192.0.2.3 54402 typ host\r\n");
 }
 
+WhipWhepPatchResult runPatch(const shared_ptr<WhipWhepSession> &session,
+                             const shared_ptr<FakeIceTransport> &transport,
+                             const WhipWhepSdpFrag &fragment,
+                             const string &if_match) {
+    const auto previous_async_calls = transport->async_calls;
+    bool callback_called = false;
+    WhipWhepPatchResult result;
+    exception_ptr error;
+    session->applyPatchAsync(fragment, if_match,
+        [&](WhipWhepPatchResult value, exception_ptr ex) {
+            callback_called = true;
+            result = std::move(value);
+            error = std::move(ex);
+        });
+
+    expect(transport->async_calls == previous_async_calls + 1,
+           "each PATCH must be dispatched to the transport poller exactly once");
+    expect(!callback_called, "PATCH completion must wait for the transport poller task");
+    transport->runPendingTasks();
+    expect(callback_called, "the transport poller task must complete the PATCH callback");
+    if (error) {
+        rethrow_exception(error);
+    }
+    return result;
+}
+
+void testPatchRunsInSingleAsyncTransportTask() {
+    auto transport = make_shared<FakeIceTransport>();
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() { return "etag-2"; });
+    bool callback_called = false;
+    WhipWhepPatchResult result;
+
+    session->applyPatchAsync(makeCandidatePatch(), "etag-1",
+        [&](WhipWhepPatchResult value, exception_ptr error) {
+            expect(!error, "candidate PATCH should not fail asynchronously");
+            callback_called = true;
+            result = std::move(value);
+        });
+
+    expect(transport->async_calls == 1, "candidate PATCH must enqueue one transport poller task");
+    expect(transport->credential_check_calls == 0,
+           "the HTTP caller must not check ICE credentials before the transport task runs");
+    expect(transport->apply_candidates_calls == 0,
+           "the HTTP caller must not apply candidates before the transport task runs");
+    expect(!callback_called, "the HTTP response callback must not run before the transport task completes");
+
+    transport->runPendingTasks();
+    expect(callback_called, "the transport task must invoke the HTTP response callback");
+    expect(result.status == WhipWhepPatchStatus::Applied, "the queued candidate PATCH should be applied");
+    expect(transport->credential_check_calls == 1,
+           "the queued task should check ICE credentials exactly once");
+    expect(transport->apply_candidates_calls == 1,
+           "the same queued task should apply candidates exactly once");
+}
+
 void testCandidatePatchRequiresCurrentEtagAndIsAtomic() {
     auto transport = make_shared<FakeIceTransport>();
-    WhipWhepSession session("etag-1", transport, []() { return "etag-2"; });
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() { return "etag-2"; });
     const auto fragment = makeCandidatePatch();
 
-    auto result = session.applyPatch(fragment, "");
+    auto result = runPatch(session, transport, fragment, "");
     expect(result.status == WhipWhepPatchStatus::PreconditionRequired,
            "candidate PATCH without If-Match should require a precondition");
     expect(transport->apply_candidates_calls == 0, "missing If-Match must not mutate transport state");
 
-    result = session.applyPatch(fragment, "etag-old");
+    result = runPatch(session, transport, fragment, "etag-old");
     expect(result.status == WhipWhepPatchStatus::PreconditionFailed,
            "candidate PATCH with an old ETag should fail");
     expect(transport->apply_candidates_calls == 0, "mismatched ETag must not mutate transport state");
 
-    result = session.applyPatch(fragment, "etag-1");
+    result = runPatch(session, transport, fragment, "etag-1");
     expect(result.status == WhipWhepPatchStatus::Applied, "candidate PATCH with the current ETag should apply");
     expect(result.etag.empty(), "ordinary candidate PATCH must not return a new ETag");
     expect(transport->apply_candidates_calls == 1, "candidate PATCH should be applied exactly once");
     expect(transport->last_candidates.candidates.size() == 1, "transport should receive parsed candidates");
-    expect(session.etag() == "etag-1", "ordinary candidate PATCH must preserve the ETag");
+    expect(session->etag() == "etag-1", "ordinary candidate PATCH must preserve the ETag");
 }
 
 void testIceRestartRequiresWildcardAndRotatesEtag() {
     auto transport = make_shared<FakeIceTransport>();
-    WhipWhepSession session("etag-1", transport, []() { return "etag-2"; });
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() { return "etag-2"; });
     const auto fragment = makeRestartPatch();
 
-    auto result = session.applyPatch(fragment, "etag-1");
+    auto result = runPatch(session, transport, fragment, "etag-1");
     expect(result.status == WhipWhepPatchStatus::PreconditionFailed,
            "ICE restart must require If-Match: *");
     expect(transport->restart_calls == 0, "invalid restart precondition must not call the transport");
 
-    result = session.applyPatch(fragment, "*");
+    result = runPatch(session, transport, fragment, "*");
     expect(result.status == WhipWhepPatchStatus::Restarted, "ICE restart with wildcard should apply");
     expect(result.etag == "etag-2", "ICE restart should return a new ETag");
     expect(result.response_fragment.hasIceRestartCredentials(),
@@ -494,12 +570,12 @@ void testIceRestartRequiresWildcardAndRotatesEtag() {
     expect(transport->last_remote_fragment.ice_pwd == "newRemotePassword123456", "restart should pass the remote pwd to transport");
     expect(transport->last_remote_fragment.candidates.size() == 1,
            "restart should pass accompanying remote candidates to transport");
-    expect(session.etag() == "etag-2", "ICE restart should rotate session ETag");
+    expect(session->etag() == "etag-2", "ICE restart should rotate session ETag");
 }
 
 void testCandidatePatchWithCurrentCredentialsIsNotAnIceRestart() {
     auto transport = make_shared<FakeIceTransport>();
-    WhipWhepSession session("etag-1", transport, []() { return "etag-2"; });
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() { return "etag-2"; });
     const auto fragment = WhipWhepSdpFrag::parse(
         "a=ice-ufrag:currentRemoteUfrag\r\n"
         "a=ice-pwd:currentRemotePassword123456\r\n"
@@ -507,13 +583,13 @@ void testCandidatePatchWithCurrentCredentialsIsNotAnIceRestart() {
         "a=mid:0\r\n"
         "a=candidate:3 1 udp 2122260223 192.0.2.4 54403 typ host\r\n");
 
-    const auto result = session.applyPatch(fragment, "etag-1");
+    const auto result = runPatch(session, transport, fragment, "etag-1");
     expect(result.status == WhipWhepPatchStatus::Applied,
            "a candidate PATCH with current ICE credentials must not be treated as a restart");
     expect(transport->apply_candidates_calls == 1, "candidate PATCH with credentials should reach the candidate adapter");
     expect(transport->restart_calls == 0, "only If-Match: * should select the ICE restart adapter");
 
-    const auto wildcard_result = session.applyPatch(makeCandidatePatch(), "*");
+    const auto wildcard_result = runPatch(session, transport, makeCandidatePatch(), "*");
     expect(wildcard_result.status == WhipWhepPatchStatus::PreconditionFailed,
            "If-Match: * without replacement credentials must not be accepted as a restart");
     expect(transport->restart_calls == 0, "missing restart credentials must not mutate the transport");
@@ -522,33 +598,33 @@ void testCandidatePatchWithCurrentCredentialsIsNotAnIceRestart() {
 void testUnsupportedRestartAndClosedSessionDoNotMutateState() {
     auto transport = make_shared<FakeIceTransport>();
     transport->restart_result = false;
-    WhipWhepSession session("etag-1", transport, []() { return "etag-2"; });
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() { return "etag-2"; });
 
-    auto result = session.applyPatch(makeRestartPatch(), "*");
+    auto result = runPatch(session, transport, makeRestartPatch(), "*");
     expect(result.status == WhipWhepPatchStatus::Unsupported,
            "an unsupported transport restart should map to Unsupported");
-    expect(session.etag() == "etag-1", "an unsupported restart must not rotate the ETag");
+    expect(session->etag() == "etag-1", "an unsupported restart must not rotate the ETag");
 
-    session.close();
-    session.close();
+    session->close();
+    session->close();
     expect(transport->close_calls == 1, "session close should be idempotent");
-    result = session.applyPatch(makeCandidatePatch(), "etag-1");
+    result = runPatch(session, transport, makeCandidatePatch(), "etag-1");
     expect(result.status == WhipWhepPatchStatus::Closed, "a closed session must reject later PATCH requests");
     expect(transport->apply_candidates_calls == 0, "closed session must not mutate transport state");
 }
 
 void testIceRestartDoesNotMutateTransportWhenEtagGenerationFails() {
     auto transport = make_shared<FakeIceTransport>();
-    WhipWhepSession session("etag-1", transport, []() -> string {
+    auto session = make_shared<WhipWhepSession>("etag-1", transport, []() -> string {
         throw runtime_error("secure random source failed");
     });
 
     expectThrows(
-        [&session]() { session.applyPatch(makeRestartPatch(), "*"); },
+        [&session, &transport]() { runPatch(session, transport, makeRestartPatch(), "*"); },
         "ETag generation failures should propagate to the HTTP adapter");
     expect(transport->restart_calls == 0,
            "ETag generation must complete before the transport starts an ICE restart");
-    expect(session.etag() == "etag-1", "failed ETag generation must preserve the current ETag");
+    expect(session->etag() == "etag-1", "failed ETag generation must preserve the current ETag");
 }
 
 } // namespace
@@ -570,6 +646,7 @@ int main() {
         testWhipWhepInvalidTargetPolicyErrors();
         testWhipWhepUrlUserInfoDetection();
         testWhipWhepSessionLocationResolution();
+        testPatchRunsInSingleAsyncTransportTask();
         testCandidatePatchRequiresCurrentEtagAndIsAtomic();
         testIceRestartRequiresWildcardAndRotatesEtag();
         testCandidatePatchWithCurrentCredentialsIsNotAnIceRestart();

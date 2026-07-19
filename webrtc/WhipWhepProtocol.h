@@ -11,6 +11,7 @@
 #ifndef ZLMEDIAKIT_WHIP_WHEP_PROTOCOL_H
 #define ZLMEDIAKIT_WHIP_WHEP_PROTOCOL_H
 
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -76,12 +77,16 @@ public:
                                 std::string &reason);
 };
 
-// 该窄接口使 HTTP PATCH 状态与 ICE 状态切换保持原子且可独立测试。实现必须在返回前
-// 完成调用；WhipWhepSession 会将其与 ETag 状态一起串行化。
+// 该窄接口使 HTTP PATCH 状态与 ICE 状态切换保持原子且可独立测试。
+// WhipWhepSession 会把一次 PATCH 的检查与更新放入同一个异步任务，并与 ETag 状态一起串行化。
 class WhipWhepIceTransport {
 public:
+    using Task = std::function<void()>;
+
     virtual ~WhipWhepIceTransport() = default;
 
+    // 成功时必须排队执行且不能内联调用 task，避免 HTTP Poller 执行 ICE 状态更新。
+    virtual bool async(Task task) = 0;
     virtual bool hasCurrentIceCredentials(const WhipWhepSdpFrag &fragment) = 0;
     virtual bool applyCandidates(const WhipWhepSdpFrag &fragment) = 0;
     virtual bool restartIce(const WhipWhepSdpFrag &remote_fragment,
@@ -104,16 +109,20 @@ struct WhipWhepPatchResult {
     WhipWhepSdpFrag response_fragment;
 };
 
-class WhipWhepSession {
+class WhipWhepSession : public std::enable_shared_from_this<WhipWhepSession> {
 public:
     using EtagFactory = std::function<std::string()>;
+    using PatchCallback = std::function<void(WhipWhepPatchResult, std::exception_ptr)>;
 
     WhipWhepSession(std::string etag, std::shared_ptr<WhipWhepIceTransport> transport, EtagFactory next_etag);
 
-    WhipWhepPatchResult applyPatch(const WhipWhepSdpFrag &fragment, const std::string &if_match);
+    void applyPatchAsync(const WhipWhepSdpFrag &fragment, const std::string &if_match, PatchCallback callback);
     std::string etag() const;
     bool closed() const;
     void close();
+
+private:
+    WhipWhepPatchResult applyPatch(const WhipWhepSdpFrag &fragment, const std::string &if_match);
 
 private:
     mutable std::mutex _mtx;
